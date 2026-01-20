@@ -4698,7 +4698,6 @@ defaultBase64Code() {
         if [[ -n "${cdnDomain}" ]]; then
             echo "line 4699"
             currentHost="${cdnDomain}"
-            add="${cdnDomain}"
         fi
     fi
 
