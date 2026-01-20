@@ -136,6 +136,7 @@ initVar() {
 
     # 域名
     domain=
+    cdnDomain=
     # 安装总进度
     totalProgress=1
 
@@ -848,6 +849,10 @@ readConfigHostPathUUID() {
     singBoxVLESSWSPath=
     singBoxVMessHTTPUpgradePath=
 
+    if [[ -e "/etc/v2ray-agent/cdnDomain" ]]; then
+        cdnDomain=$(cat /etc/v2ray-agent/cdnDomain)
+    fi
+
     if [[ "${coreInstallType}" == "1" ]]; then
 
         # 安装
@@ -1371,6 +1376,7 @@ installWarp() {
 # 通过dns检查域名的IP
 checkDNSIP() {
     echo "跳过IP检测"
+	ipType=4
 }
 # 检查端口实际开放状态
 checkPortOpen() {
@@ -1381,6 +1387,12 @@ checkPortOpen() {
 initTLSNginxConfig() {
     handleNginx stop
     echoContent skyBlue "\n进度  $1/${totalProgress} : 初始化Nginx申请证书配置"
+    read -r -p "输入小黄云域名，如不使用小黄云请直接回车跳过:" cdnDomain
+    if [[ -n "${cdnDomain}" ]]; then
+        echo "${cdnDomain}" >/etc/v2ray-agent/cdnDomain
+    else
+        rm -rf /etc/v2ray-agent/cdnDomain >/dev/null 2>&1
+    fi
     if [[ -n "${currentHost}" && -z "${lastInstallationConfig}" ]]; then
         echo
         read -r -p "读取到上次安装记录，是否使用上次安装时的域名 ？[y/n]:" historyDomainStatus
@@ -1576,8 +1588,15 @@ singBoxNginxConfig() {
     nginxH2Conf="listen ${port} http2 so_keepalive=on ssl;"
     nginxVersion=$(nginx -v 2>&1)
 
+    local _domain="${domain}"
     local singBoxNginxSSL=
-    singBoxNginxSSL="ssl_certificate /etc/v2ray-agent/tls/${domain}.crt;ssl_certificate_key /etc/v2ray-agent/tls/${domain}.key;"
+    if [[ -n "${cdnDomain}" ]]; then
+        echo "line 1584"
+        _domain="${cdnDomain}"
+        singBoxNginxSSL="ssl_certificate /etc/v2ray-agent/tls/${cdnDomain}.crt;ssl_certificate_key /etc/v2ray-agent/tls/${cdnDomain}.key;"
+    else
+        singBoxNginxSSL="ssl_certificate /etc/v2ray-agent/tls/${domain}.crt;ssl_certificate_key /etc/v2ray-agent/tls/${domain}.key;"
+    fi
 
     if echo "${nginxVersion}" | grep -q "1.25" && [[ $(echo "${nginxVersion}" | awk -F "[.]" '{print $3}') -gt 0 ]] || [[ $(echo "${nginxVersion}" | awk -F "[.]" '{print $2}') -gt 25 ]]; then
         nginxH2Conf="listen ${port} so_keepalive=on ssl;http2 on;"
@@ -1588,7 +1607,7 @@ singBoxNginxConfig() {
 server {
 	${nginxH2Conf}
 
-	server_name ${domain};
+	server_name ${_domain};
 	root ${nginxStaticPath};
     ${singBoxNginxSSL}
 
@@ -1881,19 +1900,16 @@ installTLS() {
             else
                 sudo "$HOME/.acme.sh/acme.sh" --installcert -d "${tlsDomain}" --fullchainpath "/etc/v2ray-agent/tls/${tlsDomain}.crt" --keypath "/etc/v2ray-agent/tls/${tlsDomain}.key" --ecc >/dev/null
             fi
+        fi
 
-        else
-            if [[ -d "$HOME/.acme.sh/${tlsDomain}_ecc" && -f "$HOME/.acme.sh/${tlsDomain}_ecc/${tlsDomain}.key" && -f "$HOME/.acme.sh/${tlsDomain}_ecc/${tlsDomain}.cer" ]] || [[ "${installedDNSAPIStatus}" == "true" ]]; then
-                if [[ -z "${lastInstallationConfig}" ]]; then
-                    echoContent yellow " ---> 如未过期或者自定义证书请选择[n]\n"
-                    read -r -p "是否重新安装？[y/n]:" reInstallStatus
-                    if [[ "${reInstallStatus}" == "y" ]]; then
-                        rm -rf /etc/v2ray-agent/tls/*
-                        installTLS "$1"
-                    fi
-                fi
+        if [[ -z $(find /etc/v2ray-agent/tls/ -name "${tlsDomain}.crt") ]] || [[ -z $(find /etc/v2ray-agent/tls/ -name "${tlsDomain}.key") ]] || [[ -z $(cat "/etc/v2ray-agent/tls/${tlsDomain}.crt") ]]; then
+            if [[ "${installedDNSAPIStatus}" == "true" ]]; then
+                sudo "$HOME/.acme.sh/acme.sh" --installcert -d "*.${dnsTLSDomain}" --fullchainpath "/etc/v2ray-agent/tls/${cdnDomain}.crt" --keypath "/etc/v2ray-agent/tls/${cdnDomain}.key" --ecc >/dev/null
+            else
+                sudo "$HOME/.acme.sh/acme.sh" --installcert -d "${tlsDomain}" --fullchainpath "/etc/v2ray-agent/tls/${cdnDomain}.crt" --keypath "/etc/v2ray-agent/tls/${cdnDomain}.key" --ecc >/dev/null
             fi
         fi
+
 
     elif [[ -d "$HOME/.acme.sh" ]] && [[ ! -f "$HOME/.acme.sh/${tlsDomain}_ecc/${tlsDomain}.cer" || ! -f "$HOME/.acme.sh/${tlsDomain}_ecc/${tlsDomain}.key" ]]; then
         switchDNSAPI
@@ -4203,10 +4219,15 @@ initSingBoxConfig() {
     local uuid=
     local addClientsStatus=
     local sslDomain=
+    local _cdnDomain="${cdnDomain}"
     if [[ -n "${domain}" ]]; then
         sslDomain="${domain}"
     elif [[ -n "${currentHost}" ]]; then
         sslDomain="${currentHost}"
+    fi
+    if [[ -z "${_cdnDomain}" ]]; then
+        echo "line 4229"
+        _cdnDomain="${sslDomain}"
     fi
     if [[ -n "${currentUUID}" && -z "${lastInstallationConfig}" ]]; then
         read -r -p "读取到上次用户配置，是否使用上次安装的配置 ？[y/n]:" historyUUIDStatus
@@ -4304,10 +4325,10 @@ EOF
           "tag":"VLESSWS",
           "users":$(initSingBoxClients 1),
           "tls":{
-            "server_name": "${sslDomain}",
+            "server_name": "${_cdnDomain}",
             "enabled": true,
-            "certificate_path": "/etc/v2ray-agent/tls/${sslDomain}.crt",
-            "key_path": "/etc/v2ray-agent/tls/${sslDomain}.key"
+            "certificate_path": "/etc/v2ray-agent/tls/${_cdnDomain}.crt",
+            "key_path": "/etc/v2ray-agent/tls/${_cdnDomain}.key"
           },
           "transport": {
             "type": "ws",
@@ -4345,10 +4366,10 @@ EOF
           "tag":"VMessWS",
           "users":$(initSingBoxClients 3),
           "tls":{
-            "server_name": "${sslDomain}",
+            "server_name": "${_cdnDomain}",
             "enabled": true,
-            "certificate_path": "/etc/v2ray-agent/tls/${sslDomain}.crt",
-            "key_path": "/etc/v2ray-agent/tls/${sslDomain}.key"
+            "certificate_path": "/etc/v2ray-agent/tls/${_cdnDomain}.crt",
+            "key_path": "/etc/v2ray-agent/tls/${_cdnDomain}.key"
           },
           "transport": {
             "type": "ws",
@@ -4672,6 +4693,15 @@ defaultBase64Code() {
     local path=$6
     local user=
     user=$(echo "${email}" | awk -F "[-]" '{print $1}')
+
+    if [[ "${type}" == *"ws"* ]] || [[ "${type}" == *"HTTPUpgrade"* ]] ; then
+        if [[ -n "${cdnDomain}" ]]; then
+            echo "line 4699"
+            currentHost="${cdnDomain}"
+            add="${cdnDomain}"
+        fi
+    fi
+
     if [[ ! -f "/etc/v2ray-agent/subscribe_local/sing-box/${user}" ]]; then
         echo [] >"/etc/v2ray-agent/subscribe_local/sing-box/${user}"
     fi
