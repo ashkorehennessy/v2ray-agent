@@ -1902,11 +1902,11 @@ installTLS() {
             fi
         fi
 
-        if [[ -z $(find /etc/v2ray-agent/tls/ -name "${tlsDomain}.crt") ]] || [[ -z $(find /etc/v2ray-agent/tls/ -name "${tlsDomain}.key") ]] || [[ -z $(cat "/etc/v2ray-agent/tls/${tlsDomain}.crt") ]]; then
+        if [[ -z $(find /etc/v2ray-agent/tls/ -name "${cdnDomain}.crt") ]] || [[ -z $(find /etc/v2ray-agent/tls/ -name "${cdnDomain}.key") ]] || [[ -z $(cat "/etc/v2ray-agent/tls/${cdnDomain}.crt") ]]; then
             if [[ "${installedDNSAPIStatus}" == "true" ]]; then
                 sudo "$HOME/.acme.sh/acme.sh" --installcert -d "*.${dnsTLSDomain}" --fullchainpath "/etc/v2ray-agent/tls/${cdnDomain}.crt" --keypath "/etc/v2ray-agent/tls/${cdnDomain}.key" --ecc >/dev/null
             else
-                sudo "$HOME/.acme.sh/acme.sh" --installcert -d "${tlsDomain}" --fullchainpath "/etc/v2ray-agent/tls/${cdnDomain}.crt" --keypath "/etc/v2ray-agent/tls/${cdnDomain}.key" --ecc >/dev/null
+                sudo "$HOME/.acme.sh/acme.sh" --installcert -d "${cdnDomain}" --fullchainpath "/etc/v2ray-agent/tls/${cdnDomain}.crt" --keypath "/etc/v2ray-agent/tls/${cdnDomain}.key" --ecc >/dev/null
             fi
         fi
 
