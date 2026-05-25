@@ -332,6 +332,9 @@ initVar() {
     # 上次安装配置状态
     lastInstallationConfig=
 
+    # CDN多运营商优选IP配置文件路径
+    cdnISPConfigFile="/etc/v2ray-agent/cdn_isp"
+
 }
 
 # 读取tls证书详情
@@ -4885,10 +4888,51 @@ EOF
         echoContent yellow " ---> 二维码 VLESS(VLESS+WS+TLS)"
         echoContent green "    https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=vless%3A%2F%2F${id}%40${add}%3A${port}%3Fencryption%3Dnone%26security%3Dtls%26type%3Dws%26host%3D${currentHost}%26fp%3Dchrome%26sni%3D${currentHost}%26path%3D${path}%23${email}"
 
+    elif [[ "${type}" == "vlesswsCDN" ]]; then
+        # 多运营商CDN优选IP - VLESS+WS+TLS
+        # $5=address(CDN优选IP), $6=path, $7=自定义host(CloudFront域名,为空则用currentHost), $8=后缀标签
+        local customHost=$7
+        local ispTag=$8
+        local actualHost="${customHost:-${currentHost}}"
+        local tagEmail="${email}_${ispTag}"
+
+        echoContent yellow " ---> 通用格式(VLESS+WS+TLS) [${ispTag}]"
+        echoContent green "    vless://${id}@${add}:${port}?encryption=none&security=tls&type=ws&host=${actualHost}&sni=${actualHost}&fp=chrome&path=${path}#${tagEmail}\n"
+
+        echoContent yellow " ---> 格式化明文(VLESS+WS+TLS) [${ispTag}]"
+        echoContent green "    协议类型:VLESS，地址:${add}，伪装域名/SNI:${actualHost}，端口:${port}，client-fingerprint: chrome,用户ID:${id}，安全:tls，传输方式:ws，路径:${path}，账户名:${tagEmail}\n"
+
+        cat <<EOF >>"/etc/v2ray-agent/subscribe_local/default/${user}"
+vless://${id}@${add}:${port}?encryption=none&security=tls&type=ws&host=${actualHost}&sni=${actualHost}&fp=chrome&path=${path}#${tagEmail}
+EOF
+        cat <<EOF >>"/etc/v2ray-agent/subscribe_local/clashMeta/${user}"
+  - name: "${tagEmail}"
+    type: vless
+    server: ${add}
+    port: ${port}
+    uuid: ${id}
+    udp: true
+    tls: true
+    network: ws
+    client-fingerprint: chrome
+    servername: ${actualHost}
+    ws-opts:
+      path: ${path}
+      headers:
+        Host: ${actualHost}
+EOF
+
+        singBoxSubscribeLocalConfig=$(jq -r ". += [{\"tag\":\"${tagEmail}\",\"type\":\"vless\",\"server\":\"${add}\",\"server_port\":${port},\"uuid\":\"${id}\",\"tls\":{\"enabled\":true,\"server_name\":\"${actualHost}\",\"utls\":{\"enabled\":true,\"fingerprint\":\"chrome\"}},\"multiplex\":{\"enabled\":false,\"protocol\":\"smux\",\"max_streams\":32},\"packet_encoding\":\"xudp\",\"transport\":{\"type\":\"ws\",\"path\":\"${path}\",\"headers\":{\"Host\":\"${actualHost}\"}}}]" "/etc/v2ray-agent/subscribe_local/sing-box/${user}")
+        echo "${singBoxSubscribeLocalConfig}" | jq . >"/etc/v2ray-agent/subscribe_local/sing-box/${user}"
+
+        echoContent yellow " ---> 二维码 VLESS(VLESS+WS+TLS) [${ispTag}]"
+        echoContent green "    https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=vless%3A%2F%2F${id}%40${add}%3A${port}%3Fencryption%3Dnone%26security%3Dtls%26type%3Dws%26host%3D${actualHost}%26fp%3Dchrome%26sni%3D${actualHost}%26path%3D${path}%23${tagEmail}"
+
     elif [[ "${type}" == "vlessXHTTP" ]]; then
 
         echoContent yellow " ---> 通用格式(VLESS+reality+XHTTP)"
         echoContent green "    vless://${id}@${add}:${port}?encryption=none&security=reality&type=xhttp&sni=${xrayVLESSRealityXHTTPServerName}&host=${xrayVLESSRealityXHTTPServerName}&fp=chrome&path=${path}&pbk=${currentRealityXHTTPPublicKey}&sid=6ba85179e30d4fc2#${email}\n"
+
 
         echoContent yellow " ---> 格式化明文(VLESS+reality+XHTTP)"
         echoContent green "协议类型:VLESS reality，地址:${add}，publicKey:${currentRealityXHTTPPublicKey}，shortId: 6ba85179e30d4fc2,serverNames：${xrayVLESSRealityXHTTPServerName}，端口:${port}，路径：${path}，SNI:${xrayVLESSRealityXHTTPServerName}，伪装域名:${xrayVLESSRealityXHTTPServerName}，用户ID:${id}，传输方式:xhttp，账户名:${email}\n"
@@ -5304,7 +5348,60 @@ showAccounts() {
             done < <(echo "${currentCDNAddress}" | tr ',' '\n')
         done
     fi
+
+    # VLESS WS - 多运营商CDN优选IP
+    if echo ${currentInstallProtocolType} | grep -q ",1," && readCDNISPConfig; then
+        local cdnEntryCount
+        cdnEntryCount=$(jq '.entries | length' "${cdnISPConfigFile}")
+
+        if [[ "${cdnEntryCount}" -gt 0 ]]; then
+            echoContent skyBlue "\n================ VLESS WS TLS [多运营商CDN优选] ================\n"
+
+            jq .inbounds[0].settings.clients//.inbounds[0].users ${configPath}03_VLESS_WS_inbounds.json | jq -c '.[]' | while read -r user; do
+                local email=
+                email=$(echo "${user}" | jq -r .email//.name)
+
+                local vlessWSPort=${currentDefaultPort}
+                if [[ "${coreInstallType}" == "2" ]]; then
+                    vlessWSPort="${singBoxVLESSWSPort}"
+                fi
+
+                local path="${currentPath}ws"
+                if [[ ${coreInstallType} == "1" ]]; then
+                    path="/${currentPath}ws"
+                elif [[ "${coreInstallType}" == "2" ]]; then
+                    path="${singBoxVLESSWSPath}"
+                fi
+
+                local cdnIndex=0
+                jq -r -c '.entries[]' "${cdnISPConfigFile}" | while read -r cdnEntry; do
+                    cdnIndex=$((cdnIndex + 1))
+                    local suffix cdnType cdnAddress cloudfrontDomain
+                    suffix=$(echo "${cdnEntry}" | jq -r '.suffix')
+                    cdnType=$(echo "${cdnEntry}" | jq -r '.cdn_type')
+                    cdnAddress=$(echo "${cdnEntry}" | jq -r '.address')
+                    cloudfrontDomain=$(echo "${cdnEntry}" | jq -r '.cloudfront_domain // ""')
+
+                    local cdnPort="${vlessWSPort}"
+                    local customHost=""
+
+                    if [[ "${cdnType}" == "cloudfront" ]]; then
+                        # CloudFront: 端口443，host/sni替换为CloudFront分配域名
+                        cdnPort="443"
+                        customHost="${cloudfrontDomain}"
+                    fi
+
+                    echoContent skyBlue "\n ---> 账号:${email} [${suffix}]"
+                    echo
+                    defaultBase64Code vlesswsCDN "${cdnPort}" "${email}" "$(echo "${user}" | jq -r .id//.uuid)" "${cdnAddress}" "${path}" "${customHost}" "${suffix}"
+                    echo
+                done
+            done
+        fi
+    fi
+
     # trojan grpc
+
     if echo ${currentInstallProtocolType} | grep -q ",2,"; then
         echoContent skyBlue "\n================================  Trojan gRPC TLS [仅CDN推荐]  ================================\n"
         jq .inbounds[0].settings.clients ${configPath}04_trojan_gRPC_inbounds.json | jq -c '.[]' | while read -r user; do
@@ -5868,6 +5965,7 @@ manageCDN() {
         echoContent yellow "4.CNAME www.visa.com.hk"
         echoContent yellow "5.手动输入[可输入多个，比如: 1.1.1.1,1.1.2.2,cloudflare.com 逗号分隔]"
         echoContent yellow "6.移除CDN节点"
+        echoContent yellow "7.多运营商CDN优选IP管理"
         echoContent red "=============================================================="
         read -r -p "请选择:" selectCDNType
         case ${selectCDNType} in
@@ -5891,6 +5989,10 @@ manageCDN() {
             echoContent green " ---> 移除成功"
             exit 0
             ;;
+        7)
+            manageCDNISP
+            return
+            ;;
         esac
 
         if [[ -n "${setCDNDomain}" ]]; then
@@ -5908,6 +6010,245 @@ manageCDN() {
         echoContent red " ---> 未检测到可以使用的协议，仅支持ws、grpc、HTTPUpgrade相关的协议"
     fi
 }
+
+# 读取多运营商CDN优选IP配置
+readCDNISPConfig() {
+    if [[ -f "${cdnISPConfigFile}" ]] && [[ -n "$(cat "${cdnISPConfigFile}")" ]]; then
+        local validJSON
+        validJSON=$(jq '.entries' "${cdnISPConfigFile}" 2>/dev/null)
+        if [[ -n "${validJSON}" && "${validJSON}" != "null" ]]; then
+            return 0
+        fi
+    fi
+    return 1
+}
+
+# 多运营商CDN优选IP管理
+manageCDNISP() {
+    echoContent skyBlue "\n===== 多运营商CDN优选IP管理 ====="
+    echoContent red "=============================================================="
+    echoContent yellow "# 说明"
+    echoContent yellow "# 为VLESS+WS配置添加多组CDN优选IP，每组使用不同的后缀名称区分"
+    echoContent yellow "# 支持Cloudflare和CloudFront两种CDN类型"
+    echoContent yellow "# Cloudflare: 替换address为优选IP/域名"
+    echoContent yellow "# CloudFront: 替换address为优选IP/域名，同时替换host和sni为CloudFront分配域名\n"
+
+    echoContent yellow "1.添加CDN优选配置"
+    echoContent yellow "2.查看当前配置"
+    echoContent yellow "3.删除指定配置"
+    echoContent yellow "4.清空所有配置"
+    echoContent yellow "5.返回上级菜单"
+    echoContent red "=============================================================="
+    read -r -p "请选择:" selectCDNISPType
+
+    case ${selectCDNISPType} in
+    1)
+        addCDNISPEntry
+        ;;
+    2)
+        showCDNISPEntries
+        ;;
+    3)
+        deleteCDNISPEntry
+        ;;
+    4)
+        clearCDNISPEntries
+        ;;
+    5)
+        manageCDN 1
+        return
+        ;;
+    *)
+        echoContent red " ---> 选择错误"
+        manageCDNISP
+        ;;
+    esac
+}
+
+# 添加CDN优选配置条目
+addCDNISPEntry() {
+    # 输入自定义后缀名称
+    read -r -p "请输入自定义CDN配置后缀名称(例如: 电信、联通、移动):" cdnSuffix
+    if [[ -z "${cdnSuffix}" ]]; then
+        echoContent red " ---> 后缀名称不可为空"
+        addCDNISPEntry
+        return
+    fi
+
+    # 检查后缀是否重复
+    if [[ -f "${cdnISPConfigFile}" ]] && [[ -n "$(cat "${cdnISPConfigFile}")" ]]; then
+        local existingSuffix
+        existingSuffix=$(jq -r '.entries[]?.suffix' "${cdnISPConfigFile}" 2>/dev/null)
+        if echo "${existingSuffix}" | grep -qx "${cdnSuffix}"; then
+            echoContent red " ---> 后缀名称 [${cdnSuffix}] 已存在，请使用其他名称"
+            addCDNISPEntry
+            return
+        fi
+    fi
+
+    # 选择CDN类型
+    echoContent yellow "\n请选择CDN类型:"
+    echoContent yellow "1.Cloudflare"
+    echoContent yellow "2.CloudFront"
+    read -r -p "请选择:" selectCDNProvider
+
+    local cdnType=""
+    local cloudfrontDomain=""
+
+    case ${selectCDNProvider} in
+    1)
+        cdnType="cloudflare"
+        ;;
+    2)
+        cdnType="cloudfront"
+        ;;
+    *)
+        echoContent red " ---> 选择错误"
+        addCDNISPEntry
+        return
+        ;;
+    esac
+
+    # 输入优选IP/域名
+    read -r -p "请输入优选IP或域名:" cdnAddress
+    if [[ -z "${cdnAddress}" ]]; then
+        echoContent red " ---> 优选IP/域名不可为空"
+        addCDNISPEntry
+        return
+    fi
+
+    # 如果是CloudFront，输入分配域名
+    if [[ "${cdnType}" == "cloudfront" ]]; then
+        read -r -p "请输入CloudFront分配域名(例如: d123456.cloudfront.net):" cloudfrontDomain
+        if [[ -z "${cloudfrontDomain}" ]]; then
+            echoContent red " ---> CloudFront分配域名不可为空"
+            addCDNISPEntry
+            return
+        fi
+    fi
+
+    # 初始化配置文件
+    if [[ ! -f "${cdnISPConfigFile}" ]] || [[ -z "$(cat "${cdnISPConfigFile}")" ]]; then
+        echo '{"entries":[]}' >"${cdnISPConfigFile}"
+    fi
+
+    # 构建新条目并追加
+    local newEntry=""
+    if [[ "${cdnType}" == "cloudflare" ]]; then
+        newEntry="{\"suffix\":\"${cdnSuffix}\",\"cdn_type\":\"cloudflare\",\"address\":\"${cdnAddress}\"}"
+    else
+        newEntry="{\"suffix\":\"${cdnSuffix}\",\"cdn_type\":\"cloudfront\",\"address\":\"${cdnAddress}\",\"cloudfront_domain\":\"${cloudfrontDomain}\"}"
+    fi
+
+    local updatedConfig
+    updatedConfig=$(jq ".entries += [${newEntry}]" "${cdnISPConfigFile}")
+    echo "${updatedConfig}" | jq . >"${cdnISPConfigFile}"
+
+    echoContent green " ---> 配置添加成功 [${cdnSuffix}]"
+    echoContent yellow "后缀: ${cdnSuffix}"
+    echoContent yellow "CDN类型: ${cdnType}"
+    echoContent yellow "优选地址: ${cdnAddress}"
+    if [[ -n "${cloudfrontDomain}" ]]; then
+        echoContent yellow "CloudFront域名: ${cloudfrontDomain}"
+    fi
+
+    read -r -p "是否立即更新订阅？[y/n]:" updateSubStatus
+    if [[ "${updateSubStatus}" == "y" ]]; then
+        subscribe false false
+    fi
+}
+
+# 查看CDN优选配置
+showCDNISPEntries() {
+    if ! readCDNISPConfig; then
+        echoContent red "\n ---> 暂无多运营商CDN优选IP配置"
+        manageCDNISP
+        return
+    fi
+
+    echoContent skyBlue "\n===== 当前多运营商CDN优选IP配置 ====="
+    echoContent red "=============================================================="
+
+    local index=0
+    jq -r -c '.entries[]' "${cdnISPConfigFile}" | while read -r entry; do
+        index=$((index + 1))
+        local suffix cdnType address cloudfrontDomain
+        suffix=$(echo "${entry}" | jq -r '.suffix')
+        cdnType=$(echo "${entry}" | jq -r '.cdn_type')
+        address=$(echo "${entry}" | jq -r '.address')
+        cloudfrontDomain=$(echo "${entry}" | jq -r '.cloudfront_domain // ""')
+
+        echoContent green "\n  [${index}] 后缀: ${suffix}"
+        echoContent yellow "      CDN类型: ${cdnType}"
+        echoContent yellow "      优选地址: ${address}"
+        if [[ -n "${cloudfrontDomain}" ]]; then
+            echoContent yellow "      CloudFront域名: ${cloudfrontDomain}"
+        fi
+    done
+
+    echoContent red "=============================================================="
+    echo
+    manageCDNISP
+}
+
+# 删除指定CDN优选配置
+deleteCDNISPEntry() {
+    if ! readCDNISPConfig; then
+        echoContent red "\n ---> 暂无多运营商CDN优选IP配置"
+        manageCDNISP
+        return
+    fi
+
+    echoContent skyBlue "\n===== 删除CDN优选IP配置 ====="
+    local index=0
+    jq -r -c '.entries[]' "${cdnISPConfigFile}" | while read -r entry; do
+        index=$((index + 1))
+        local suffix cdnType address
+        suffix=$(echo "${entry}" | jq -r '.suffix')
+        cdnType=$(echo "${entry}" | jq -r '.cdn_type')
+        address=$(echo "${entry}" | jq -r '.address')
+        echoContent yellow "  ${index}. [${suffix}] ${cdnType} - ${address}"
+    done
+
+    local entryCount
+    entryCount=$(jq '.entries | length' "${cdnISPConfigFile}")
+
+    read -r -p "请输入要删除的编号(1-${entryCount}):" delIndex
+    if [[ -z "${delIndex}" ]] || [[ "${delIndex}" -lt 1 ]] || [[ "${delIndex}" -gt "${entryCount}" ]]; then
+        echoContent red " ---> 输入错误"
+        deleteCDNISPEntry
+        return
+    fi
+
+    local delArrayIndex=$((delIndex - 1))
+    local deletedSuffix
+    deletedSuffix=$(jq -r ".entries[${delArrayIndex}].suffix" "${cdnISPConfigFile}")
+
+    local updatedConfig
+    updatedConfig=$(jq "del(.entries[${delArrayIndex}])" "${cdnISPConfigFile}")
+    echo "${updatedConfig}" | jq . >"${cdnISPConfigFile}"
+
+    echoContent green " ---> 已删除配置 [${deletedSuffix}]"
+
+    read -r -p "是否立即更新订阅？[y/n]:" updateSubStatus
+    if [[ "${updateSubStatus}" == "y" ]]; then
+        subscribe false false
+    fi
+}
+
+# 清空所有CDN优选配置
+clearCDNISPEntries() {
+    if [[ -f "${cdnISPConfigFile}" ]]; then
+        echo '{"entries":[]}' >"${cdnISPConfigFile}"
+    fi
+    echoContent green " ---> 已清空所有多运营商CDN优选IP配置"
+
+    read -r -p "是否立即更新订阅？[y/n]:" updateSubStatus
+    if [[ "${updateSubStatus}" == "y" ]]; then
+        subscribe false false
+    fi
+}
+
 # 自定义uuid
 customUUID() {
     read -r -p "请输入合法的UUID，[回车]随机UUID:" currentCustomUUID
