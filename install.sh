@@ -335,6 +335,10 @@ initVar() {
     # CDN多运营商优选IP配置文件路径
     cdnISPConfigFile="/etc/v2ray-agent/cdn_isp"
 
+    # XHTTP+TLS上下行分离配置文件路径
+    xhttpSplitConfigFile="/etc/v2ray-agent/xhttp_split"
+    xrayVLESSXHTTPTLSPort=
+
 }
 
 # 读取tls证书详情
@@ -396,7 +400,7 @@ readInstallType() {
     if [[ -d "/etc/v2ray-agent" ]]; then
         if [[ -f "/etc/v2ray-agent/xray/xray" ]]; then
             # 检测xray-core
-            if [[ -d "/etc/v2ray-agent/xray/conf" ]] && [[ -f "/etc/v2ray-agent/xray/conf/02_VLESS_TCP_inbounds.json" || -f "/etc/v2ray-agent/xray/conf/02_trojan_TCP_inbounds.json" || -f "/etc/v2ray-agent/xray/conf/07_VLESS_vision_reality_inbounds.json" || -f "/etc/v2ray-agent/xray/conf/12_VLESS_XHTTP_inbounds.json" ]]; then
+            if [[ -d "/etc/v2ray-agent/xray/conf" ]] && [[ -f "/etc/v2ray-agent/xray/conf/02_VLESS_TCP_inbounds.json" || -f "/etc/v2ray-agent/xray/conf/02_trojan_TCP_inbounds.json" || -f "/etc/v2ray-agent/xray/conf/07_VLESS_vision_reality_inbounds.json" || -f "/etc/v2ray-agent/xray/conf/12_VLESS_XHTTP_inbounds.json" || -f "/etc/v2ray-agent/xray/conf/14_VLESS_XHTTP_TLS_inbounds.json" ]]; then
                 # xray-core
                 configPath=/etc/v2ray-agent/xray/conf/
                 ctlPath=/etc/v2ray-agent/xray/xray
@@ -485,6 +489,10 @@ readInstallProtocolType() {
             #                frontingType=03_VLESS_WS_inbounds
             #                singBoxVLESSWSPort=$(jq .inbounds[0].listen_port "${row}.json")
             #            fi
+        fi
+        if echo "${row}" | grep -q VLESS_XHTTP_TLS_inbounds; then
+            currentInstallProtocolType="${currentInstallProtocolType}14,"
+            xrayVLESSXHTTPTLSPort=$(jq -r .inbounds[0].port "${row}.json")
         fi
 
         if echo "${row}" | grep -q trojan_gRPC_inbounds; then
@@ -2823,6 +2831,11 @@ initXrayClients() {
             currentUser="{\"id\":\"${uuid}\",\"email\":\"${email}-VLESS_Reality_XHTTP\"}"
             users=$(echo "${users}" | jq -r ". +=[${currentUser}]")
         fi
+        # VLESS XHTTP TLS
+        if echo "${type}" | grep -q ",14,"; then
+            currentUser="{\"id\":\"${uuid}\",\"email\":\"${email}-VLESS_XHTTP_TLS\"}"
+            users=$(echo "${users}" | jq -r ". +=[${currentUser}]")
+        fi
         # trojan grpc
         if echo "${type}" | grep -q ",2,"; then
             currentUser="{\"password\":\"${uuid}\",\"email\":\"${email}-Trojan_gRPC\"}"
@@ -4055,6 +4068,47 @@ EOF
     elif [[ -z "$3" ]]; then
         rm /etc/v2ray-agent/xray/conf/12_VLESS_XHTTP_inbounds.json >/dev/null 2>&1
     fi
+    # VLESS_XHTTP_TLS (behind TLS, CDN compatible, split stream support)
+    if echo "${selectCustomInstallType}" | grep -q ",14," || [[ "$1" == "all" ]]; then
+        initXrayXHTTPTLSPort
+        cat <<EOF >/etc/v2ray-agent/xray/conf/14_VLESS_XHTTP_TLS_inbounds.json
+{
+"inbounds":[
+    {
+	  "port": ${xHTTPTLSPort},
+	  "listen": "0.0.0.0",
+	  "protocol": "vless",
+	  "tag":"VLESSXHTTPTLS",
+	  "settings": {
+		"clients": $(initXrayClients 14),
+		"decryption": "none"
+	  },
+	  "streamSettings": {
+		"network": "xhttp",
+		"security": "tls",
+		"tlsSettings": {
+            "certificates": [
+                {
+                    "certificateFile": "/etc/v2ray-agent/tls/${domain}.crt",
+                    "keyFile": "/etc/v2ray-agent/tls/${domain}.key",
+                    "ocspStapling": 3600
+                }
+            ]
+        },
+        "xhttpSettings": {
+            "path": "/${customPath}xHTTP",
+            "mode": "auto"
+        }
+	  }
+	}
+]
+}
+EOF
+        allowPort "${xHTTPTLSPort}"
+        allowPort "${xHTTPTLSPort}" "udp"
+    elif [[ -z "$3" ]]; then
+        rm /etc/v2ray-agent/xray/conf/14_VLESS_XHTTP_TLS_inbounds.json >/dev/null 2>&1
+    fi
     if echo "${selectCustomInstallType}" | grep -q ",3," || [[ "$1" == "all" ]]; then
         fallbacksList=${fallbacksList}',{"path":"/'${customPath}'vws","dest":31299,"xver":1}'
         cat <<EOF >/etc/v2ray-agent/xray/conf/05_VMess_WS_inbounds.json
@@ -4964,6 +5018,82 @@ EOF
         echoContent yellow " ---> 二维码 VLESS(VLESS+reality+XHTTP)"
         echoContent green "    https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=vless%3A%2F%2F${id}%40${add}%3A${port}%3Fencryption%3Dnone%26security%3Dreality%26type%3Dxhttp%26sni%3D${xrayVLESSRealityXHTTPServerName}%26fp%3Dchrome%26path%3D${path}%26host%3D${xrayVLESSRealityXHTTPServerName}%26pbk%3D${currentRealityXHTTPPublicKey}%26sid%3D6ba85179e30d4fc2%23${email}\n"
 
+    elif [[ "${type}" == "vlessXHTTPTLS" ]]; then
+
+        local extraParam=""
+        local extraJSON="$7"
+        if [[ -n "${extraJSON}" ]]; then
+            extraParam="&extra=$(echo "${extraJSON}" | jq -c . | jq -sRr @uri)"
+        fi
+
+        local modeParam="&mode=stream-up"
+
+        echoContent yellow " ---> 通用格式(VLESS+XHTTP+TLS)"
+        echoContent green "    vless://${id}@${add}:${port}?encryption=none&security=tls&type=xhttp&sni=${currentHost}&host=${currentHost}&fp=chrome&path=${path}${modeParam}${extraParam}#${email}\n"
+
+        echoContent yellow " ---> 格式化明文(VLESS+XHTTP+TLS)"
+        echoContent green "协议类型:VLESS TLS，地址:${add}，端口:${port}，路径：${path}，SNI:${currentHost}，用户ID:${id}，传输方式:xhttp(stream-up)，账户名:${email}\n"
+        cat <<EOF >>"/etc/v2ray-agent/subscribe_local/default/${user}"
+vless://${id}@${add}:${port}?encryption=none&security=tls&type=xhttp&sni=${currentHost}&host=${currentHost}&fp=chrome&path=${path}${modeParam}${extraParam}#${email}
+EOF
+
+        # clashMeta/mihomo subscription
+        if [[ -n "${extraJSON}" ]]; then
+            local dlAddr dlPort dlSni dlPath
+            dlAddr=$(echo "${extraJSON}" | jq -r '.downloadSettings.address')
+            dlPort=$(echo "${extraJSON}" | jq -r '.downloadSettings.port')
+            dlSni=$(echo "${extraJSON}" | jq -r '.downloadSettings.tlsSettings.serverName')
+            dlPath=$(echo "${extraJSON}" | jq -r '.downloadSettings.xhttpSettings.path')
+            cat <<EOF >>"/etc/v2ray-agent/subscribe_local/clashMeta/${user}"
+  - name: "${email}"
+    type: vless
+    server: ${add}
+    port: ${port}
+    uuid: ${id}
+    udp: true
+    tls: true
+    network: xhttp
+    alpn: [h2]
+    servername: ${currentHost}
+    client-fingerprint: chrome
+    encryption: ""
+    xhttp-opts:
+      path: /${path}
+      host: ${currentHost}
+      mode: stream-up
+      download-settings:
+        path: ${dlPath}
+        host: ${dlSni}
+        server: ${dlAddr}
+        port: ${dlPort}
+        tls: true
+        servername: ${dlSni}
+        client-fingerprint: chrome
+EOF
+        else
+            cat <<EOF >>"/etc/v2ray-agent/subscribe_local/clashMeta/${user}"
+  - name: "${email}"
+    type: vless
+    server: ${add}
+    port: ${port}
+    uuid: ${id}
+    udp: true
+    tls: true
+    network: xhttp
+    alpn: [h2]
+    servername: ${currentHost}
+    client-fingerprint: chrome
+    encryption: ""
+    xhttp-opts:
+      path: /${path}
+      host: ${currentHost}
+      mode: stream-up
+EOF
+        fi
+
+        echoContent yellow " ---> 二维码 VLESS(VLESS+XHTTP+TLS)"
+        echoContent green "    https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=vless%3A%2F%2F${id}%40${add}%3A${port}%3Fencryption%3Dnone%26security%3Dtls%26type%3Dxhttp%26sni%3D${currentHost}%26fp%3Dchrome%26path%3D${path}%26host%3D${currentHost}%23${email}\n"
+
     elif
         [[ "${type}" == "vlessgrpc" ]]
     then
@@ -5605,6 +5735,56 @@ showAccounts() {
             done < <(echo "${currentCDNAddress}" | tr ',' '\n')
         done
     fi
+    # VLESS XHTTP TLS
+    if echo ${currentInstallProtocolType} | grep -q ",14,"; then
+        echoContent skyBlue "\n================================ VLESS XHTTP TLS [CDN可用，支持上下行分离] ================================\n"
+
+        jq .inbounds[0].settings.clients ${configPath}14_VLESS_XHTTP_TLS_inbounds.json | jq -c '.[]' | while read -r user; do
+            local email=
+            email=$(echo "${user}" | jq -r .email)
+            echo
+            local path="${currentPath}xHTTP"
+
+            local count=
+            while read -r line; do
+                echoContent skyBlue "\n ---> 账号:${email}${count}"
+                if [[ -z "${line}" ]]; then
+                    line=$(getPublicIP)
+                fi
+                if [[ -n "${line}" ]]; then
+                    defaultBase64Code vlessXHTTPTLS "${xrayVLESSXHTTPTLSPort}" "${email}${count}" "$(echo "${user}" | jq -r .id)" "${line}" "${path}"
+                    count=$((count + 1))
+                    echo
+                fi
+            done < <(echo "${currentCDNAddress}" | tr ',' '\n')
+
+            # 上下行分离配置
+            if [[ -f "${xhttpSplitConfigFile}" ]]; then
+                local splitEntryCount
+                splitEntryCount=$(jq '.entries | length' "${xhttpSplitConfigFile}" 2>/dev/null)
+                if [[ -n "${splitEntryCount}" && "${splitEntryCount}" -gt 0 ]]; then
+                    local i=0
+                    while [[ ${i} -lt ${splitEntryCount} ]]; do
+                        local splitSuffix splitUlAddr splitDlAddr splitDlPort splitDlSni
+                        splitSuffix=$(jq -r ".entries[${i}].suffix" "${xhttpSplitConfigFile}")
+                        splitUlAddr=$(jq -r ".entries[${i}].ul_address" "${xhttpSplitConfigFile}")
+                        splitDlAddr=$(jq -r ".entries[${i}].dl_address" "${xhttpSplitConfigFile}")
+                        splitDlPort=$(jq -r ".entries[${i}].dl_port" "${xhttpSplitConfigFile}")
+                        splitDlSni=$(jq -r ".entries[${i}].dl_sni" "${xhttpSplitConfigFile}")
+
+                        local extraJSON="{\"downloadSettings\":{\"address\":\"${splitDlAddr}\",\"port\":${splitDlPort},\"network\":\"xhttp\",\"security\":\"tls\",\"tlsSettings\":{\"serverName\":\"${splitDlSni}\"},\"xhttpSettings\":{\"path\":\"/${path}\"}}}"
+
+                        echoContent skyBlue "\n ---> 账号:${email}-${splitSuffix} [上下行分离]"
+                        echoContent green "    上行: ${splitUlAddr}:${xrayVLESSXHTTPTLSPort}"
+                        echoContent green "    下行: ${splitDlAddr}:${splitDlPort} (SNI: ${splitDlSni})"
+                        defaultBase64Code vlessXHTTPTLS "${xrayVLESSXHTTPTLSPort}" "${email}-${splitSuffix}" "$(echo "${user}" | jq -r .id)" "${splitUlAddr}" "${path}" "${extraJSON}"
+                        echo
+                        i=$((i + 1))
+                    done
+                fi
+            fi
+        done
+    fi
     # AnyTLS
     if echo ${currentInstallProtocolType} | grep -q ",13,"; then
         echoContent skyBlue "\n================================  AnyTLS ================================\n"
@@ -5966,6 +6146,7 @@ manageCDN() {
         echoContent yellow "5.手动输入[可输入多个，比如: 1.1.1.1,1.1.2.2,cloudflare.com 逗号分隔]"
         echoContent yellow "6.移除CDN节点"
         echoContent yellow "7.多运营商CDN优选IP管理"
+        echoContent yellow "8.XHTTP上下行分离管理"
         echoContent red "=============================================================="
         read -r -p "请选择:" selectCDNType
         case ${selectCDNType} in
@@ -5991,6 +6172,10 @@ manageCDN() {
             ;;
         7)
             manageCDNISP
+            return
+            ;;
+        8)
+            manageXHTTPSplit
             return
             ;;
         esac
@@ -6487,6 +6672,13 @@ addUser() {
             clients=$(jq -r "${userConfig} = ${clients}" ${configPath}13_anytls_inbounds.json)
             echo "${clients}" | jq . >${configPath}13_anytls_inbounds.json
         fi
+        # VLESS XHTTP TLS
+        if echo "${currentInstallProtocolType}" | grep -q ",14,"; then
+            local clients=
+            clients=$(initXrayClients 14 "${uuid}" "${email}")
+            clients=$(jq -r "${userConfig} = ${clients}" ${configPath}14_VLESS_XHTTP_TLS_inbounds.json)
+            echo "${clients}" | jq . >${configPath}14_VLESS_XHTTP_TLS_inbounds.json
+        fi
     done
     reloadCore
     echoContent green " ---> 添加完成"
@@ -6593,6 +6785,12 @@ removeUser() {
             local anyTLSResult
             anyTLSResult=$(jq -r 'del(.inbounds[0].users['"${delUserIndex}"'])' "${singBoxConfigPath}13_anytls_inbounds.json")
             echo "${anyTLSResult}" | jq . >"${singBoxConfigPath}13_anytls_inbounds.json"
+        fi
+        # VLESS XHTTP TLS
+        if echo ${currentInstallProtocolType} | grep -q ",14,"; then
+            local xhttpTLSResult
+            xhttpTLSResult=$(jq -r 'del(.inbounds[0].settings.clients['"${delUserIndex}"'])' ${configPath}14_VLESS_XHTTP_TLS_inbounds.json)
+            echo "${xhttpTLSResult}" | jq . >${configPath}14_VLESS_XHTTP_TLS_inbounds.json
         fi
         reloadCore
         readNginxSubscribe
@@ -8822,6 +9020,7 @@ customXrayInstall() {
     echoContent yellow "7.VLESS+Reality+uTLS+Vision[推荐]"
     # echoContent yellow "8.VLESS+Reality+gRPC"
     echoContent yellow "12.VLESS+Reality+XHTTP+TLS[CDN可用]"
+    echoContent yellow "14.VLESS+XHTTP+TLS[CDN可用，支持上下行分离]"
     read -r -p "请选择[多选]，[例如:1,2,3]:" selectCustomInstallType
     echoContent skyBlue "--------------------------------------------------------------"
     if echo "${selectCustomInstallType}" | grep -q "，"; then
@@ -10114,6 +10313,192 @@ initXrayXHTTPort() {
         allowPort "${xHTTPort}"
         allowPort "${xHTTPort}" "udp"
         echoContent yellow "\n ---> 端口: ${xHTTPort}"
+    fi
+}
+
+# 初始化XHTTP+TLS端口
+initXrayXHTTPTLSPort() {
+    if [[ -n "${xrayVLESSXHTTPTLSPort}" && -z "${lastInstallationConfig}" ]]; then
+        read -r -p "读取到上次XHTTP+TLS安装记录，是否使用上次安装时的端口 ？[y/n]:" historyXHTTPTLSPortStatus
+        if [[ "${historyXHTTPTLSPortStatus}" == "y" ]]; then
+            xHTTPTLSPort=${xrayVLESSXHTTPTLSPort}
+        fi
+    elif [[ -n "${xrayVLESSXHTTPTLSPort}" && -n "${lastInstallationConfig}" ]]; then
+        xHTTPTLSPort=${xrayVLESSXHTTPTLSPort}
+    fi
+
+    if [[ -z "${xHTTPTLSPort}" ]]; then
+        echoContent yellow "请输入XHTTP+TLS端口[回车随机10000-30000]"
+        read -r -p "端口:" xHTTPTLSPort
+        if [[ -z "${xHTTPTLSPort}" ]]; then
+            xHTTPTLSPort=$((RANDOM % 20001 + 10000))
+        fi
+        if [[ -n "${xHTTPTLSPort}" && "${xrayVLESSXHTTPTLSPort}" == "${xHTTPTLSPort}" ]]; then
+            handleXray stop
+        else
+            checkPort "${xHTTPTLSPort}"
+        fi
+    fi
+    if [[ -z "${xHTTPTLSPort}" ]]; then
+        initXrayXHTTPTLSPort
+    else
+        allowPort "${xHTTPTLSPort}"
+        allowPort "${xHTTPTLSPort}" "udp"
+        echoContent yellow "\n ---> XHTTP+TLS 端口: ${xHTTPTLSPort}"
+    fi
+}
+
+# XHTTP上下行分离管理
+manageXHTTPSplit() {
+    echoContent skyBlue "\n===== XHTTP上下行分离管理 ====="
+    echoContent red "=============================================================="
+    echoContent yellow "# 说明"
+    echoContent yellow "# 配置上下行分离后，上行走指定中转服务器，下行走CDN"
+    echoContent yellow "# 所有配置会写入订阅，客户端拉取即可使用"
+    echoContent red "=============================================================="
+    echoContent yellow "1.添加上下行分离配置"
+    echoContent yellow "2.查看当前配置"
+    echoContent yellow "3.删除单条配置"
+    echoContent yellow "4.清空所有配置"
+    echoContent yellow "0.返回"
+    read -r -p "请选择:" selectXHTTPSplitType
+    case ${selectXHTTPSplitType} in
+    1)
+        addXHTTPSplitEntry
+        ;;
+    2)
+        showXHTTPSplitEntries
+        ;;
+    3)
+        deleteXHTTPSplitEntry
+        ;;
+    4)
+        clearXHTTPSplitEntries
+        ;;
+    *)
+        return
+        ;;
+    esac
+}
+
+# 添加XHTTP上下行分离配置
+addXHTTPSplitEntry() {
+    if ! echo ${currentInstallProtocolType} | grep -q ",14,"; then
+        echoContent red " ---> 请先安装VLESS+XHTTP+TLS协议（选项14）"
+        return
+    fi
+
+    read -r -p "请输入配置后缀名称（如: CF下行）:" splitSuffix
+    if [[ -z "${splitSuffix}" ]]; then
+        echoContent red " ---> 名称不能为空"
+        return
+    fi
+
+    if [[ -f "${xhttpSplitConfigFile}" ]]; then
+        local exists
+        exists=$(jq -r ".entries[] | select(.suffix == \"${splitSuffix}\")" "${xhttpSplitConfigFile}" 2>/dev/null)
+        if [[ -n "${exists}" ]]; then
+            echoContent red " ---> 后缀名称 [${splitSuffix}] 已存在"
+            return
+        fi
+    fi
+
+    read -r -p "请输入上行地址（中转服务器IP/域名）:" splitUlAddr
+    if [[ -z "${splitUlAddr}" ]]; then
+        echoContent red " ---> 上行地址不能为空"
+        return
+    fi
+
+    read -r -p "请输入下行地址（CDN优选IP/域名）:" splitDlAddr
+    if [[ -z "${splitDlAddr}" ]]; then
+        echoContent red " ---> 下行地址不能为空"
+        return
+    fi
+
+    read -r -p "请输入下行端口[默认:443]:" splitDlPort
+    if [[ -z "${splitDlPort}" ]]; then
+        splitDlPort=443
+    fi
+
+    read -r -p "请输入下行SNI（如: d123456.cloudfront.net）:" splitDlSni
+    if [[ -z "${splitDlSni}" ]]; then
+        echoContent red " ---> 下行SNI不能为空"
+        return
+    fi
+
+    if [[ ! -f "${xhttpSplitConfigFile}" ]] || [[ -z "$(cat "${xhttpSplitConfigFile}" 2>/dev/null)" ]]; then
+        echo '{"entries":[]}' >"${xhttpSplitConfigFile}"
+    fi
+
+    local newEntry="{\"suffix\":\"${splitSuffix}\",\"ul_address\":\"${splitUlAddr}\",\"dl_address\":\"${splitDlAddr}\",\"dl_port\":${splitDlPort},\"dl_sni\":\"${splitDlSni}\"}"
+    local updated
+    updated=$(jq ".entries += [${newEntry}]" "${xhttpSplitConfigFile}")
+    echo "${updated}" | jq . >"${xhttpSplitConfigFile}"
+
+    echoContent green " ---> 添加成功: ${splitSuffix}"
+    echoContent green "      上行: ${splitUlAddr} | 下行: ${splitDlAddr}:${splitDlPort} SNI:${splitDlSni}"
+
+    read -r -p "是否立即更新订阅？[y/n]:" updateSubStatus
+    if [[ "${updateSubStatus}" == "y" ]]; then
+        subscribe false false
+    fi
+}
+
+showXHTTPSplitEntries() {
+    if [[ ! -f "${xhttpSplitConfigFile}" ]]; then
+        echoContent yellow " ---> 暂无配置"
+        return
+    fi
+    local entryCount
+    entryCount=$(jq '.entries | length' "${xhttpSplitConfigFile}" 2>/dev/null)
+    if [[ -z "${entryCount}" || "${entryCount}" -eq 0 ]]; then
+        echoContent yellow " ---> 暂无配置"
+        return
+    fi
+    echoContent skyBlue "\n当前XHTTP上下行分离配置:"
+    local i=0
+    while [[ ${i} -lt ${entryCount} ]]; do
+        local suffix ulAddr dlAddr dlPort dlSni
+        suffix=$(jq -r ".entries[${i}].suffix" "${xhttpSplitConfigFile}")
+        ulAddr=$(jq -r ".entries[${i}].ul_address" "${xhttpSplitConfigFile}")
+        dlAddr=$(jq -r ".entries[${i}].dl_address" "${xhttpSplitConfigFile}")
+        dlPort=$(jq -r ".entries[${i}].dl_port" "${xhttpSplitConfigFile}")
+        dlSni=$(jq -r ".entries[${i}].dl_sni" "${xhttpSplitConfigFile}")
+        echoContent green "  $((i + 1)). [${suffix}] 上行:${ulAddr} 下行:${dlAddr}:${dlPort} SNI:${dlSni}"
+        i=$((i + 1))
+    done
+}
+
+deleteXHTTPSplitEntry() {
+    showXHTTPSplitEntries
+    local entryCount
+    entryCount=$(jq '.entries | length' "${xhttpSplitConfigFile}" 2>/dev/null)
+    if [[ -z "${entryCount}" || "${entryCount}" -eq 0 ]]; then
+        return
+    fi
+    read -r -p "请输入要删除的编号:" delIndex
+    if [[ -z "${delIndex}" || ${delIndex} -lt 1 || ${delIndex} -gt ${entryCount} ]]; then
+        echoContent red " ---> 编号无效"
+        return
+    fi
+    local updated
+    updated=$(jq "del(.entries[$((delIndex - 1))])" "${xhttpSplitConfigFile}")
+    echo "${updated}" | jq . >"${xhttpSplitConfigFile}"
+    echoContent green " ---> 删除成功"
+    read -r -p "是否立即更新订阅？[y/n]:" updateSubStatus
+    if [[ "${updateSubStatus}" == "y" ]]; then
+        subscribe false false
+    fi
+}
+
+clearXHTTPSplitEntries() {
+    if [[ -f "${xhttpSplitConfigFile}" ]]; then
+        echo '{"entries":[]}' >"${xhttpSplitConfigFile}"
+    fi
+    echoContent green " ---> 已清空所有上下行分离配置"
+    read -r -p "是否立即更新订阅？[y/n]:" updateSubStatus
+    if [[ "${updateSubStatus}" == "y" ]]; then
+        subscribe false false
     fi
 }
 
