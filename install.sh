@@ -401,19 +401,38 @@ readInstallType() {
         if [[ -f "/etc/v2ray-agent/xray/xray" ]]; then
             # 检测xray-core
             if [[ -d "/etc/v2ray-agent/xray/conf" ]] && [[ -f "/etc/v2ray-agent/xray/conf/02_VLESS_TCP_inbounds.json" || -f "/etc/v2ray-agent/xray/conf/02_trojan_TCP_inbounds.json" || -f "/etc/v2ray-agent/xray/conf/07_VLESS_vision_reality_inbounds.json" || -f "/etc/v2ray-agent/xray/conf/12_VLESS_XHTTP_inbounds.json" || -f "/etc/v2ray-agent/xray/conf/14_VLESS_XHTTP_TLS_inbounds.json" ]]; then
-                # xray-core
-                configPath=/etc/v2ray-agent/xray/conf/
-                ctlPath=/etc/v2ray-agent/xray/xray
-                coreInstallType=1
 
-                if [[ -f "${configPath}07_VLESS_vision_reality_inbounds.json" ]]; then
-                    realityStatus=7
+                # 判断 xray 是否只有 XHTTP+TLS（无其他协议）
+                local xrayOnlyXHTTPTLS=false
+                if [[ -f "/etc/v2ray-agent/xray/conf/14_VLESS_XHTTP_TLS_inbounds.json" ]] && \
+                   [[ ! -f "/etc/v2ray-agent/xray/conf/02_VLESS_TCP_inbounds.json" ]] && \
+                   [[ ! -f "/etc/v2ray-agent/xray/conf/02_trojan_TCP_inbounds.json" ]] && \
+                   [[ ! -f "/etc/v2ray-agent/xray/conf/07_VLESS_vision_reality_inbounds.json" ]] && \
+                   [[ ! -f "/etc/v2ray-agent/xray/conf/12_VLESS_XHTTP_inbounds.json" ]]; then
+                    xrayOnlyXHTTPTLS=true
                 fi
-                if [[ -f "${configPath}12_VLESS_XHTTP_inbounds.json" ]]; then
-                    realityStatus=12
-                fi
-                if [[ -f "/etc/v2ray-agent/sing-box/sing-box" ]] && [[ -f "/etc/v2ray-agent/sing-box/conf/config/06_hysteria2_inbounds.json" || -f "/etc/v2ray-agent/sing-box/conf/config/09_tuic_inbounds.json" || -f "/etc/v2ray-agent/sing-box/conf/config/20_socks5_inbounds.json" ]]; then
+
+                # 如果 xray 只有 XHTTP+TLS 且 sing-box 有主要协议，以 sing-box 为主核心
+                if [[ "${xrayOnlyXHTTPTLS}" == "true" ]] && [[ -f "/etc/v2ray-agent/sing-box/sing-box" && -f "/etc/v2ray-agent/sing-box/conf/config.json" ]]; then
+                    ctlPath=/etc/v2ray-agent/sing-box/sing-box
+                    coreInstallType=2
+                    configPath=/etc/v2ray-agent/sing-box/conf/config/
                     singBoxConfigPath=/etc/v2ray-agent/sing-box/conf/config/
+                else
+                    # xray-core 为主核心
+                    configPath=/etc/v2ray-agent/xray/conf/
+                    ctlPath=/etc/v2ray-agent/xray/xray
+                    coreInstallType=1
+
+                    if [[ -f "${configPath}07_VLESS_vision_reality_inbounds.json" ]]; then
+                        realityStatus=7
+                    fi
+                    if [[ -f "${configPath}12_VLESS_XHTTP_inbounds.json" ]]; then
+                        realityStatus=12
+                    fi
+                    if [[ -f "/etc/v2ray-agent/sing-box/sing-box" ]] && [[ -f "/etc/v2ray-agent/sing-box/conf/config/06_hysteria2_inbounds.json" || -f "/etc/v2ray-agent/sing-box/conf/config/09_tuic_inbounds.json" || -f "/etc/v2ray-agent/sing-box/conf/config/20_socks5_inbounds.json" ]]; then
+                        singBoxConfigPath=/etc/v2ray-agent/sing-box/conf/config/
+                    fi
                 fi
             fi
         elif [[ -f "/etc/v2ray-agent/sing-box/sing-box" && -f "/etc/v2ray-agent/sing-box/conf/config.json" ]]; then
@@ -609,6 +628,11 @@ readInstallProtocolType() {
             currentInstallProtocolType="${currentInstallProtocolType}9,"
             singBoxTuicPort=$(jq .inbounds[0].listen_port "${singBoxConfigPath}09_tuic_inbounds.json")
         fi
+    fi
+    # sing-box 为主核心时，额外检测 xray 的 XHTTP+TLS
+    if [[ "${coreInstallType}" == "2" && -f "/etc/v2ray-agent/xray/conf/14_VLESS_XHTTP_TLS_inbounds.json" ]]; then
+        currentInstallProtocolType="${currentInstallProtocolType}14,"
+        xrayVLESSXHTTPTLSPort=$(jq -r .inbounds[0].port "/etc/v2ray-agent/xray/conf/14_VLESS_XHTTP_TLS_inbounds.json")
     fi
     if [[ "${currentInstallProtocolType:0:1}" != "," ]]; then
         currentInstallProtocolType=",${currentInstallProtocolType}"
@@ -1031,14 +1055,35 @@ showInstallStatus() {
         if echo ${currentInstallProtocolType} | grep -q ",13,"; then
             echoContent yellow "AnyTLS \c"
         fi
+        if echo ${currentInstallProtocolType} | grep -q ",14,"; then
+            echoContent yellow "VLESS+XHTTP+TLS \c"
+        fi
+        # 共存时显示 xray-core 状态
+        if [[ "${coreInstallType}" == "2" ]] && [[ -f "/etc/v2ray-agent/xray/conf/14_VLESS_XHTTP_TLS_inbounds.json" ]]; then
+            if [[ -n $(pgrep -f "xray/xray") ]]; then
+                echoContent yellow "\n副核心: Xray-core[运行中]"
+            else
+                echoContent yellow "\n副核心: Xray-core[未运行]"
+            fi
+        fi
     fi
 }
 
 # 清理旧残留
 cleanUp() {
     if [[ "$1" == "xrayDel" ]]; then
-        handleXray stop
-        rm -rf /etc/v2ray-agent/xray/*
+        if [[ -f "/etc/v2ray-agent/xray/conf/14_VLESS_XHTTP_TLS_inbounds.json" ]]; then
+            # 保留 XHTTP+TLS 配置和 xray 核心，只删除其他 inbound 配置
+            handleXray stop
+            for file in /etc/v2ray-agent/xray/conf/*_inbounds.json; do
+                [[ "$(basename "$file")" == "14_VLESS_XHTTP_TLS_inbounds.json" ]] && continue
+                rm -f "${file}"
+            done
+            handleXray start
+        else
+            handleXray stop
+            rm -rf /etc/v2ray-agent/xray/*
+        fi
     elif [[ "$1" == "singBoxDel" ]]; then
         handleSingBox stop
         rm -rf /etc/v2ray-agent/sing-box/conf/config.json >/dev/null 2>&1
@@ -5739,11 +5784,16 @@ showAccounts() {
     if echo ${currentInstallProtocolType} | grep -q ",14,"; then
         echoContent skyBlue "\n================================ VLESS XHTTP TLS [CDN可用，支持上下行分离] ================================\n"
 
-        jq .inbounds[0].settings.clients ${configPath}14_VLESS_XHTTP_TLS_inbounds.json | jq -c '.[]' | while read -r user; do
+        jq .inbounds[0].settings.clients /etc/v2ray-agent/xray/conf/14_VLESS_XHTTP_TLS_inbounds.json | jq -c '.[]' | while read -r user; do
             local email=
             email=$(echo "${user}" | jq -r .email)
             echo
-            local path="${currentPath}xHTTP"
+            local path
+            if [[ -n "${currentPath}" ]]; then
+                path="${currentPath}xHTTP"
+            else
+                path=$(jq -r .inbounds[0].streamSettings.xhttpSettings.path /etc/v2ray-agent/xray/conf/14_VLESS_XHTTP_TLS_inbounds.json | sed 's|^/||')
+            fi
 
             local count=
             while read -r line; do
@@ -6132,68 +6182,63 @@ manageCDN() {
     echoContent skyBlue "\n进度 $1/1 : CDN节点管理"
     local setCDNDomain=
 
-    if echo "${currentInstallProtocolType}" | grep -qE ",1,|,2,|,3,|,5,|,11,"; then
-        echoContent red "=============================================================="
-        echoContent yellow "# 注意事项"
-        echoContent yellow "\n教程地址:"
-        echoContent skyBlue "https://www.v2ray-agent.com/archives/cloudflarezi-xuan-ip"
-        echoContent red "\n如对Cloudflare优化不了解，请不要使用"
+    echoContent red "=============================================================="
+    echoContent yellow "# 注意事项"
+    echoContent yellow "\n教程地址:"
+    echoContent skyBlue "https://www.v2ray-agent.com/archives/cloudflarezi-xuan-ip"
+    echoContent red "\n如对Cloudflare优化不了解，请不要使用"
 
-        echoContent yellow "1.CNAME www.digitalocean.com"
-        echoContent yellow "2.CNAME who.int"
-        echoContent yellow "3.CNAME blog.hostmonit.com"
-        echoContent yellow "4.CNAME www.visa.com.hk"
-        echoContent yellow "5.手动输入[可输入多个，比如: 1.1.1.1,1.1.2.2,cloudflare.com 逗号分隔]"
-        echoContent yellow "6.移除CDN节点"
-        echoContent yellow "7.多运营商CDN优选IP管理"
-        echoContent yellow "8.XHTTP上下行分离管理"
-        echoContent red "=============================================================="
-        read -r -p "请选择:" selectCDNType
-        case ${selectCDNType} in
-        1)
-            setCDNDomain="www.digitalocean.com"
-            ;;
-        2)
-            setCDNDomain="who.int"
-            ;;
-        3)
-            setCDNDomain="blog.hostmonit.com"
-            ;;
-        4)
-            setCDNDomain="www.visa.com.hk"
-            ;;
-        5)
-            read -r -p "请输入想要自定义CDN IP或者域名:" setCDNDomain
-            ;;
-        6)
-            echo >/etc/v2ray-agent/cdn
-            echoContent green " ---> 移除成功"
-            exit 0
-            ;;
-        7)
-            manageCDNISP
-            return
-            ;;
-        8)
-            manageXHTTPSplit
-            return
-            ;;
-        esac
+    echoContent yellow "1.CNAME www.digitalocean.com"
+    echoContent yellow "2.CNAME who.int"
+    echoContent yellow "3.CNAME blog.hostmonit.com"
+    echoContent yellow "4.CNAME www.visa.com.hk"
+    echoContent yellow "5.手动输入[可输入多个，比如: 1.1.1.1,1.1.2.2,cloudflare.com 逗号分隔]"
+    echoContent yellow "6.移除CDN节点"
+    echoContent yellow "7.多运营商CDN优选IP管理"
+    echoContent yellow "8.XHTTP上下行分离管理"
+    echoContent red "=============================================================="
+    read -r -p "请选择:" selectCDNType
+    case ${selectCDNType} in
+    1)
+        setCDNDomain="www.digitalocean.com"
+        ;;
+    2)
+        setCDNDomain="who.int"
+        ;;
+    3)
+        setCDNDomain="blog.hostmonit.com"
+        ;;
+    4)
+        setCDNDomain="www.visa.com.hk"
+        ;;
+    5)
+        read -r -p "请输入想要自定义CDN IP或者域名:" setCDNDomain
+        ;;
+    6)
+        echo >/etc/v2ray-agent/cdn
+        echoContent green " ---> 移除成功"
+        exit 0
+        ;;
+    7)
+        manageCDNISP
+        return
+        ;;
+    8)
+        manageXHTTPSplit
+        return
+        ;;
+    esac
 
-        if [[ -n "${setCDNDomain}" ]]; then
-            echo >/etc/v2ray-agent/cdn
-            echo "${setCDNDomain}" >"/etc/v2ray-agent/cdn"
-            echoContent green " ---> 修改CDN成功"
-            subscribe false false
-        else
-            echoContent red " ---> 不可以为空，请重新输入"
-            manageCDN 1
-        fi
+    if [[ -n "${setCDNDomain}" ]]; then
+        echo >/etc/v2ray-agent/cdn
+        echo "${setCDNDomain}" >"/etc/v2ray-agent/cdn"
+        echoContent green " ---> 修改CDN成功"
+        subscribe false false
     else
-        echoContent yellow "\n教程地址:"
-        echoContent skyBlue "https://www.v2ray-agent.com/archives/cloudflarezi-xuan-ip\n"
-        echoContent red " ---> 未检测到可以使用的协议，仅支持ws、grpc、HTTPUpgrade相关的协议"
+        echoContent red " ---> 不可以为空，请重新输入"
+        manageCDN 1
     fi
+
 }
 
 # 读取多运营商CDN优选IP配置
@@ -6676,8 +6721,8 @@ addUser() {
         if echo "${currentInstallProtocolType}" | grep -q ",14,"; then
             local clients=
             clients=$(initXrayClients 14 "${uuid}" "${email}")
-            clients=$(jq -r "${userConfig} = ${clients}" ${configPath}14_VLESS_XHTTP_TLS_inbounds.json)
-            echo "${clients}" | jq . >${configPath}14_VLESS_XHTTP_TLS_inbounds.json
+            clients=$(jq -r "${userConfig} = ${clients}" /etc/v2ray-agent/xray/conf/14_VLESS_XHTTP_TLS_inbounds.json)
+            echo "${clients}" | jq . >/etc/v2ray-agent/xray/conf/14_VLESS_XHTTP_TLS_inbounds.json
         fi
     done
     reloadCore
@@ -6789,8 +6834,8 @@ removeUser() {
         # VLESS XHTTP TLS
         if echo ${currentInstallProtocolType} | grep -q ",14,"; then
             local xhttpTLSResult
-            xhttpTLSResult=$(jq -r 'del(.inbounds[0].settings.clients['"${delUserIndex}"'])' ${configPath}14_VLESS_XHTTP_TLS_inbounds.json)
-            echo "${xhttpTLSResult}" | jq . >${configPath}14_VLESS_XHTTP_TLS_inbounds.json
+            xhttpTLSResult=$(jq -r 'del(.inbounds[0].settings.clients['"${delUserIndex}"'])' /etc/v2ray-agent/xray/conf/14_VLESS_XHTTP_TLS_inbounds.json)
+            echo "${xhttpTLSResult}" | jq . >/etc/v2ray-agent/xray/conf/14_VLESS_XHTTP_TLS_inbounds.json
         fi
         reloadCore
         readNginxSubscribe
@@ -8595,6 +8640,11 @@ reloadCore() {
         handleXray stop
         handleXray start
     fi
+    # sing-box 为主核心时，如果 xray 有 XHTTP+TLS 配置也重启 xray
+    if [[ "${coreInstallType}" == "2" ]] && [[ -f "/etc/v2ray-agent/xray/conf/14_VLESS_XHTTP_TLS_inbounds.json" ]]; then
+        handleXray stop
+        handleXray start
+    fi
     if echo "${currentInstallProtocolType}" | grep -q ",20," || [[ "${coreInstallType}" == "2" || -n "${singBoxConfigPath}" ]]; then
         handleSingBox stop
         handleSingBox start
@@ -9020,7 +9070,6 @@ customXrayInstall() {
     echoContent yellow "7.VLESS+Reality+uTLS+Vision[推荐]"
     # echoContent yellow "8.VLESS+Reality+gRPC"
     echoContent yellow "12.VLESS+Reality+XHTTP+TLS[CDN可用]"
-    echoContent yellow "14.VLESS+XHTTP+TLS[CDN可用，支持上下行分离]"
     read -r -p "请选择[多选]，[例如:1,2,3]:" selectCustomInstallType
     echoContent skyBlue "--------------------------------------------------------------"
     if echo "${selectCustomInstallType}" | grep -q "，"; then
@@ -10578,6 +10627,89 @@ realityScanner() {
         echoContent red " ---> 无法读取正确IP"
     fi
 }
+
+# XHTTP+TLS 独立安装（不影响 sing-box）
+xrayXHTTPTLSInstall() {
+    if ! echo "${currentInstallProtocolType}" | grep -qE ",0,|,1,|,2,|,3,|,4,|,5,|,6,|,9,|,10,"; then
+        echoContent red "\n ---> 由于需要依赖证书，请先安装带有TLS标识的协议"
+        exit 0
+    fi
+
+    # 从已有TLS证书获取域名（sing-box安装时已申请）
+    if [[ -z "${domain}" ]]; then
+        local certFile
+        certFile=$(find /etc/v2ray-agent/tls/ -name "*.crt" -not -name "*.key" 2>/dev/null | head -1)
+        if [[ -n "${certFile}" ]]; then
+            domain=$(basename "${certFile}" .crt)
+            echoContent green " ---> 检测到TLS证书域名: ${domain}"
+        fi
+    fi
+    if [[ -z "${domain}" ]]; then
+        echoContent red "\n ---> 未找到TLS证书，请先安装带有TLS标识的协议"
+        exit 0
+    fi
+
+    # 生成随机路径前缀（如果没有现有的）
+    if [[ -z "${customPath}" ]]; then
+        if [[ -n "${currentPath}" ]]; then
+            customPath="${currentPath}"
+        else
+            customPath=$(head -n 50 /dev/urandom | tr -dc 'a-z' | head -c 2)
+        fi
+    fi
+
+    totalProgress=5
+
+    # 确保 configPath 指向 xray 配置目录
+    configPath=/etc/v2ray-agent/xray/conf/
+
+    installXray 1 false
+    installXrayService 2
+    selectCustomInstallType=",14,"
+    initXrayConfig custom 3 true
+    reloadCore
+    showAccounts 4
+}
+
+# XHTTP+TLS 卸载（不影响 sing-box）
+unInstallXHTTPTLS() {
+    rm -f /etc/v2ray-agent/xray/conf/14_VLESS_XHTTP_TLS_inbounds.json
+    rm -f /etc/v2ray-agent/xhttp_split
+    # 如果 xray 没有其他 inbound 配置了，停止 xray
+    if ! ls /etc/v2ray-agent/xray/conf/*_inbounds.json >/dev/null 2>&1; then
+        handleXray stop
+    else
+        reloadCore
+    fi
+    echoContent green " ---> XHTTP+TLS 卸载完成"
+}
+
+# XHTTP+TLS 管理菜单
+manageXHTTP() {
+    echoContent skyBlue "\n进度  1/1 : XHTTP+TLS 管理"
+    echoContent red "\n=============================================================="
+    local xhttpStatus=
+    if [[ -n "${configPath}" ]] && [[ -f "/etc/v2ray-agent/xray/conf/14_VLESS_XHTTP_TLS_inbounds.json" ]]; then
+        echoContent yellow "依赖xray-core内核\n"
+        echoContent yellow "1.重新安装"
+        echoContent yellow "2.卸载"
+        echoContent yellow "3.上下行分离管理"
+        xhttpStatus=true
+    else
+        echoContent yellow "依赖xray-core内核\n"
+        echoContent yellow "1.安装"
+    fi
+    echoContent red "=============================================================="
+    read -r -p "请选择:" installXHTTPStatus
+    if [[ "${installXHTTPStatus}" == "1" ]]; then
+        xrayXHTTPTLSInstall
+    elif [[ "${installXHTTPStatus}" == "2" && "${xhttpStatus}" == "true" ]]; then
+        unInstallXHTTPTLS
+    elif [[ "${installXHTTPStatus}" == "3" && "${xhttpStatus}" == "true" ]]; then
+        manageXHTTPSplit
+    fi
+}
+
 # hysteria管理
 manageHysteria() {
     echoContent skyBlue "\n进度  1/1 : Hysteria2 管理"
@@ -10731,6 +10863,7 @@ menu() {
     echoContent yellow "4.Hysteria2管理"
     echoContent yellow "5.REALITY管理"
     echoContent yellow "6.Tuic管理"
+    echoContent yellow "19.XHTTP+TLS管理"
 
     echoContent skyBlue "-------------------------工具管理-----------------------------"
     echoContent yellow "7.用户管理"
@@ -10805,6 +10938,9 @@ menu() {
         ;;
     18)
         bbrInstall
+        ;;
+    19)
+        manageXHTTP
         ;;
     20)
         unInstall 1
