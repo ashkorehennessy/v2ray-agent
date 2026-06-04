@@ -10745,6 +10745,7 @@ manageXHTTP() {
         echoContent yellow "依赖xray-core内核\n"
         echoContent yellow "1.安装"
     fi
+    echoContent yellow "4.配置上行Nginx反代[在中转机上执行]"
     echoContent red "=============================================================="
     read -r -p "请选择:" installXHTTPStatus
     if [[ "${installXHTTPStatus}" == "1" ]]; then
@@ -10753,7 +10754,287 @@ manageXHTTP() {
         unInstallXHTTPTLS
     elif [[ "${installXHTTPStatus}" == "3" && "${xhttpStatus}" == "true" ]]; then
         manageXHTTPSplit
+    elif [[ "${installXHTTPStatus}" == "4" ]]; then
+        setupXHTTPNginxProxy
     fi
+}
+
+# 配置XHTTP上行Nginx反代（在中转/反代服务器上执行）
+setupXHTTPNginxProxy() {
+    echoContent skyBlue "\n===== 配置XHTTP上行Nginx反代 ====="
+    echoContent red "=============================================================="
+    echoContent yellow "# 说明"
+    echoContent yellow "# 此功能在中转/反代服务器上执行（非源站）"
+    echoContent yellow "# 使用nginx grpc_pass将上行XHTTP流量反代到源站"
+    echoContent yellow "# 客户端TLS握手终止在本机，降低首包延迟"
+    echoContent red "=============================================================="
+
+    echoContent yellow "1.安装/更新反代配置"
+    echoContent yellow "2.查看当前配置"
+    echoContent yellow "3.卸载反代配置"
+    echoContent yellow "0.返回"
+    read -r -p "请选择:" proxyAction
+    case ${proxyAction} in
+    1)
+        installXHTTPNginxProxy
+        ;;
+    2)
+        showXHTTPNginxProxy
+        ;;
+    3)
+        removeXHTTPNginxProxy
+        ;;
+    *)
+        return
+        ;;
+    esac
+}
+
+# 安装XHTTP Nginx反代
+installXHTTPNginxProxy() {
+    # 检查 nginx
+    if ! command -v nginx >/dev/null 2>&1; then
+        echoContent red " ---> 未检测到nginx，请先安装nginx"
+        return
+    fi
+
+    # 检查 nginx 是否支持 grpc_pass
+    if ! nginx -V 2>&1 | grep -q "http_v2_module"; then
+        echoContent red " ---> nginx不支持HTTP/2模块，请重新编译nginx或使用支持grpc的版本"
+        return
+    fi
+
+    # 检查TLS证书
+    local localDomain=""
+    local certFile
+    certFile=$(find /etc/v2ray-agent/tls/ -name "*.crt" -not -name "*.key" 2>/dev/null | head -1)
+    if [[ -n "${certFile}" ]]; then
+        localDomain=$(basename "${certFile}" .crt)
+        echoContent green " ---> 检测到本机TLS证书: ${localDomain}"
+    else
+        echoContent red " ---> 未检测到TLS证书"
+        echoContent yellow " ---> 请先通过本脚本安装带有TLS的协议以申请证书，或手动将证书放置到 /etc/v2ray-agent/tls/ 目录"
+        return
+    fi
+
+    echoContent skyBlue "\n===== 源站配置 ====="
+    read -r -p "请输入源站服务器域名（如: sin.example.com）:" backendAddr
+    if [[ -z "${backendAddr}" ]]; then
+        echoContent red " ---> 源站地址不能为空"
+        return
+    fi
+
+    read -r -p "请输入源站XHTTP端口（如: 11466）:" backendPort
+    if [[ -z "${backendPort}" ]]; then
+        echoContent red " ---> 源站端口不能为空"
+        return
+    fi
+
+    read -r -p "请输入XHTTP路径（含前缀，如: /vlxHTTP）[默认:/vlxHTTP]:" xhttpPath
+    if [[ -z "${xhttpPath}" ]]; then
+        xhttpPath="/vlxHTTP"
+    fi
+    # 确保以 / 开头
+    if [[ "${xhttpPath:0:1}" != "/" ]]; then
+        xhttpPath="/${xhttpPath}"
+    fi
+
+    echoContent skyBlue "\n===== 本机监听配置 ====="
+
+    # 检测是否有可复用的nginx SSL配置
+    local existingConf=""
+    local existingPort=""
+    if [[ -d "/etc/nginx/conf.d" ]]; then
+        for conf in /etc/nginx/conf.d/*.conf; do
+            if [[ -f "${conf}" ]] && grep -q "${localDomain}" "${conf}" 2>/dev/null && grep -q "ssl" "${conf}" 2>/dev/null; then
+                existingPort=$(grep -E '^\s*listen\s+' "${conf}" | head -1 | grep -oE '[0-9]+' | head -1)
+                if [[ -n "${existingPort}" ]]; then
+                    existingConf="${conf}"
+                    break
+                fi
+            fi
+        done
+    fi
+
+    local listenPort
+    if [[ -n "${existingConf}" ]]; then
+        echoContent green " ---> 检测到已有SSL配置: $(basename "${existingConf}") (端口: ${existingPort})"
+        read -r -p "是否复用该端口？[y/n, 默认:y]:" reusePort
+        if [[ "${reusePort}" != "n" ]]; then
+            listenPort="${existingPort}"
+        fi
+    fi
+
+    if [[ -z "${listenPort}" ]]; then
+        read -r -p "请输入本机监听端口[默认:443]:" listenPort
+        if [[ -z "${listenPort}" ]]; then
+            listenPort=443
+        fi
+    fi
+
+    # 开放防火墙端口
+    allowPort "${listenPort}"
+
+    local nginxConfFile="/etc/nginx/conf.d/xhttp_grpc_proxy.conf"
+
+    if [[ -n "${existingConf}" && "${listenPort}" == "${existingPort}" ]]; then
+        # 复用已有配置：向已有 server 块插入 location
+        # 先移除旧的 xhttp location（如果有）
+        if grep -q "# XHTTP_GRPC_PROXY_START" "${existingConf}" 2>/dev/null; then
+            sed -i '/# XHTTP_GRPC_PROXY_START/,/# XHTTP_GRPC_PROXY_END/d' "${existingConf}"
+        fi
+
+        # 在最后一个 } 之前插入 location 块
+        local locationBlock
+        locationBlock=$(cat <<INNER
+# XHTTP_GRPC_PROXY_START
+    location ${xhttpPath} {
+        grpc_pass grpcs://${backendAddr}:${backendPort};
+        grpc_ssl_server_name on;
+        grpc_ssl_name ${backendAddr};
+        grpc_ssl_protocols TLSv1.3;
+        grpc_read_timeout 3600s;
+        grpc_send_timeout 3600s;
+        grpc_set_header Host ${backendAddr};
+    }
+# XHTTP_GRPC_PROXY_END
+INNER
+)
+        # 在文件最后一个 } 之前插入
+        sed -i "/^}$/i\\${locationBlock//$'\n'/\\n}" "${existingConf}" 2>/dev/null
+        if [[ $? -ne 0 ]]; then
+            # sed 处理多行插入失败时，使用 awk 替代
+            awk -v block="${locationBlock}" '
+            /^}$/ && !done { print block; done=1 }
+            { print }
+            ' "${existingConf}" > "${existingConf}.tmp" && mv "${existingConf}.tmp" "${existingConf}"
+        fi
+        nginxConfFile="${existingConf}"
+    else
+        # 创建独立配置文件
+        cat <<EOF >"${nginxConfFile}"
+# XHTTP 上行反代配置 - 由 v2ray-agent 生成
+server {
+    listen ${listenPort} ssl;
+    http2 on;
+    server_name ${localDomain};
+
+    ssl_certificate /etc/v2ray-agent/tls/${localDomain}.crt;
+    ssl_certificate_key /etc/v2ray-agent/tls/${localDomain}.key;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers TLS13_AES_128_GCM_SHA256:TLS13_AES_256_GCM_SHA384:TLS13_CHACHA20_POLY1305_SHA256:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305;
+    ssl_prefer_server_ciphers on;
+
+    location ${xhttpPath} {
+        grpc_pass grpcs://${backendAddr}:${backendPort};
+        grpc_ssl_server_name on;
+        grpc_ssl_name ${backendAddr};
+        grpc_ssl_protocols TLSv1.3;
+        grpc_read_timeout 3600s;
+        grpc_send_timeout 3600s;
+        grpc_set_header Host ${backendAddr};
+    }
+
+    location / {
+        root /usr/share/nginx/html;
+        index index.html;
+    }
+}
+EOF
+    fi
+
+    # 验证 nginx 配置
+    local nginxTestResult
+    nginxTestResult=$(nginx -t 2>&1)
+    if echo "${nginxTestResult}" | grep -q "successful"; then
+        nginx -s reload 2>/dev/null
+        echoContent green "\n ---> Nginx XHTTP反代配置成功！"
+        echoContent green "=============================================================="
+        echoContent green "  本机域名: ${localDomain}"
+        echoContent green "  监听端口: ${listenPort}"
+        echoContent green "  反代路径: ${xhttpPath}"
+        echoContent green "  源站地址: ${backendAddr}:${backendPort}"
+        echoContent green "  配置文件: ${nginxConfFile}"
+        echoContent green "=============================================================="
+        echoContent yellow "\n客户端上行配置参考:"
+        echoContent green "  地址: ${localDomain}"
+        echoContent green "  端口: ${listenPort}"
+        echoContent green "  SNI: ${localDomain}"
+        echoContent green "  模式: stream-up"
+
+        # 保存反代信息
+        cat <<EOF >/etc/v2ray-agent/xhttp_nginx_proxy
+{"local_domain":"${localDomain}","listen_port":${listenPort},"backend_addr":"${backendAddr}","backend_port":${backendPort},"xhttp_path":"${xhttpPath}","nginx_conf":"${nginxConfFile}"}
+EOF
+    else
+        echoContent red "\n ---> Nginx配置测试失败:"
+        echo "${nginxTestResult}"
+        if [[ "${nginxConfFile}" == "/etc/nginx/conf.d/xhttp_grpc_proxy.conf" ]]; then
+            rm -f "${nginxConfFile}"
+        fi
+    fi
+}
+
+# 查看XHTTP Nginx反代配置
+showXHTTPNginxProxy() {
+    local proxyInfoFile="/etc/v2ray-agent/xhttp_nginx_proxy"
+    if [[ ! -f "${proxyInfoFile}" ]]; then
+        echoContent yellow " ---> 暂无反代配置"
+        return
+    fi
+    local localDomain listenPort backendAddr backendPort xhttpPath nginxConf
+    localDomain=$(jq -r '.local_domain' "${proxyInfoFile}")
+    listenPort=$(jq -r '.listen_port' "${proxyInfoFile}")
+    backendAddr=$(jq -r '.backend_addr' "${proxyInfoFile}")
+    backendPort=$(jq -r '.backend_port' "${proxyInfoFile}")
+    xhttpPath=$(jq -r '.xhttp_path' "${proxyInfoFile}")
+    nginxConf=$(jq -r '.nginx_conf' "${proxyInfoFile}")
+
+    echoContent skyBlue "\n当前XHTTP Nginx反代配置:"
+    echoContent green "  本机域名: ${localDomain}"
+    echoContent green "  监听端口: ${listenPort}"
+    echoContent green "  反代路径: ${xhttpPath}"
+    echoContent green "  源站地址: ${backendAddr}:${backendPort}"
+    echoContent green "  配置文件: ${nginxConf}"
+
+    if [[ -n $(pgrep -f "nginx") ]]; then
+        echoContent green "  Nginx状态: 运行中"
+    else
+        echoContent red "  Nginx状态: 未运行"
+    fi
+}
+
+# 卸载XHTTP Nginx反代
+removeXHTTPNginxProxy() {
+    local proxyInfoFile="/etc/v2ray-agent/xhttp_nginx_proxy"
+    if [[ ! -f "${proxyInfoFile}" ]]; then
+        echoContent yellow " ---> 暂无反代配置"
+        return
+    fi
+
+    local nginxConf
+    nginxConf=$(jq -r '.nginx_conf' "${proxyInfoFile}")
+
+    read -r -p "确认卸载XHTTP Nginx反代配置？[y/n]:" confirmRemove
+    if [[ "${confirmRemove}" != "y" ]]; then
+        return
+    fi
+
+    if [[ -n "${nginxConf}" ]]; then
+        # 如果是独立配置文件，直接删除
+        if [[ "${nginxConf}" == "/etc/nginx/conf.d/xhttp_grpc_proxy.conf" ]]; then
+            rm -f "${nginxConf}"
+        else
+            # 如果是嵌入到其他配置文件的 location，移除标记的块
+            if grep -q "# XHTTP_GRPC_PROXY_START" "${nginxConf}" 2>/dev/null; then
+                sed -i '/# XHTTP_GRPC_PROXY_START/,/# XHTTP_GRPC_PROXY_END/d' "${nginxConf}"
+            fi
+        fi
+    fi
+
+    rm -f "${proxyInfoFile}"
+    nginx -s reload 2>/dev/null
+    echoContent green " ---> XHTTP Nginx反代配置已卸载"
 }
 
 # hysteria管理
