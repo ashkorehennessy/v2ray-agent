@@ -5067,19 +5067,34 @@ EOF
 
         local extraParam=""
         local extraJSON="$7"
+        local ulSni="${8:-${currentHost}}"
         if [[ -n "${extraJSON}" ]]; then
             extraParam="&extra=$(echo "${extraJSON}" | jq -c . | jq -sRr @uri)"
         fi
 
-        local modeParam="&mode=stream-up"
+        # 直连节点用 auto，分离节点用 stream-up
+        local modeParam=""
+        local modeDisplay="auto"
+        if [[ -n "${extraJSON}" ]]; then
+            modeParam="&mode=stream-up"
+            modeDisplay="stream-up"
+        fi
+
+        # 获取域名用于读取路径（sing-box为主核心时 currentHost 可能来自 sing-box）
+        local xhttpHost="${currentHost}"
+        if [[ -z "${xhttpHost}" ]]; then
+            local certFile
+            certFile=$(find /etc/v2ray-agent/tls/ -name "*.crt" -not -name "*.key" 2>/dev/null | head -1)
+            [[ -n "${certFile}" ]] && xhttpHost=$(basename "${certFile}" .crt)
+        fi
 
         echoContent yellow " ---> 通用格式(VLESS+XHTTP+TLS)"
-        echoContent green "    vless://${id}@${add}:${port}?encryption=none&security=tls&type=xhttp&sni=${currentHost}&host=${currentHost}&fp=chrome&path=${path}${modeParam}${extraParam}#${email}\n"
+        echoContent green "    vless://${id}@${add}:${port}?encryption=none&security=tls&type=xhttp&sni=${ulSni}&host=${ulSni}&fp=chrome&path=${path}${modeParam}${extraParam}#${email}\n"
 
         echoContent yellow " ---> 格式化明文(VLESS+XHTTP+TLS)"
-        echoContent green "协议类型:VLESS TLS，地址:${add}，端口:${port}，路径：${path}，SNI:${currentHost}，用户ID:${id}，传输方式:xhttp(stream-up)，账户名:${email}\n"
+        echoContent green "协议类型:VLESS TLS，地址:${add}，端口:${port}，路径：${path}，SNI:${ulSni}，用户ID:${id}，传输方式:xhttp(${modeDisplay})，账户名:${email}\n"
         cat <<EOF >>"/etc/v2ray-agent/subscribe_local/default/${user}"
-vless://${id}@${add}:${port}?encryption=none&security=tls&type=xhttp&sni=${currentHost}&host=${currentHost}&fp=chrome&path=${path}${modeParam}${extraParam}#${email}
+vless://${id}@${add}:${port}?encryption=none&security=tls&type=xhttp&sni=${ulSni}&host=${ulSni}&fp=chrome&path=${path}${modeParam}${extraParam}#${email}
 EOF
 
         # clashMeta/mihomo subscription
@@ -5099,12 +5114,12 @@ EOF
     tls: true
     network: xhttp
     alpn: [h2]
-    servername: ${currentHost}
+    servername: ${ulSni}
     client-fingerprint: chrome
     encryption: ""
     xhttp-opts:
       path: /${path}
-      host: ${currentHost}
+      host: ${ulSni}
       mode: stream-up
       download-settings:
         path: ${dlPath}
@@ -5126,18 +5141,17 @@ EOF
     tls: true
     network: xhttp
     alpn: [h2]
-    servername: ${currentHost}
+    servername: ${xhttpHost}
     client-fingerprint: chrome
     encryption: ""
     xhttp-opts:
       path: /${path}
-      host: ${currentHost}
-      mode: stream-up
+      host: ${xhttpHost}
 EOF
         fi
 
         echoContent yellow " ---> 二维码 VLESS(VLESS+XHTTP+TLS)"
-        echoContent green "    https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=vless%3A%2F%2F${id}%40${add}%3A${port}%3Fencryption%3Dnone%26security%3Dtls%26type%3Dxhttp%26sni%3D${currentHost}%26fp%3Dchrome%26path%3D${path}%26host%3D${currentHost}%23${email}\n"
+        echoContent green "    https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=vless%3A%2F%2F${id}%40${add}%3A${port}%3Fencryption%3Dnone%26security%3Dtls%26type%3Dxhttp%26sni%3D${ulSni}%26fp%3Dchrome%26path%3D${path}%26host%3D${ulSni}%23${email}\n"
 
     elif
         [[ "${type}" == "vlessgrpc" ]]
@@ -5815,19 +5829,25 @@ showAccounts() {
                 if [[ -n "${splitEntryCount}" && "${splitEntryCount}" -gt 0 ]]; then
                     local i=0
                     while [[ ${i} -lt ${splitEntryCount} ]]; do
-                        local splitSuffix splitUlAddr splitDlAddr splitDlPort splitDlSni
+                        local splitSuffix splitUlAddr splitUlPort splitUlSni splitDlAddr splitDlPort splitDlSni
                         splitSuffix=$(jq -r ".entries[${i}].suffix" "${xhttpSplitConfigFile}")
                         splitUlAddr=$(jq -r ".entries[${i}].ul_address" "${xhttpSplitConfigFile}")
+                        splitUlPort=$(jq -r ".entries[${i}].ul_port" "${xhttpSplitConfigFile}")
+                        splitUlSni=$(jq -r ".entries[${i}].ul_sni" "${xhttpSplitConfigFile}")
                         splitDlAddr=$(jq -r ".entries[${i}].dl_address" "${xhttpSplitConfigFile}")
                         splitDlPort=$(jq -r ".entries[${i}].dl_port" "${xhttpSplitConfigFile}")
                         splitDlSni=$(jq -r ".entries[${i}].dl_sni" "${xhttpSplitConfigFile}")
 
+                        # 兼容旧配置（无 ul_port/ul_sni 字段）
+                        [[ "${splitUlPort}" == "null" || -z "${splitUlPort}" ]] && splitUlPort="${xrayVLESSXHTTPTLSPort}"
+                        [[ "${splitUlSni}" == "null" || -z "${splitUlSni}" ]] && splitUlSni="${currentHost}"
+
                         local extraJSON="{\"downloadSettings\":{\"address\":\"${splitDlAddr}\",\"port\":${splitDlPort},\"network\":\"xhttp\",\"security\":\"tls\",\"tlsSettings\":{\"serverName\":\"${splitDlSni}\"},\"xhttpSettings\":{\"path\":\"/${path}\"}}}"
 
                         echoContent skyBlue "\n ---> 账号:${email}-${splitSuffix} [上下行分离]"
-                        echoContent green "    上行: ${splitUlAddr}:${xrayVLESSXHTTPTLSPort}"
+                        echoContent green "    上行: ${splitUlAddr}:${splitUlPort} (SNI: ${splitUlSni})"
                         echoContent green "    下行: ${splitDlAddr}:${splitDlPort} (SNI: ${splitDlSni})"
-                        defaultBase64Code vlessXHTTPTLS "${xrayVLESSXHTTPTLSPort}" "${email}-${splitSuffix}" "$(echo "${user}" | jq -r .id)" "${splitUlAddr}" "${path}" "${extraJSON}"
+                        defaultBase64Code vlessXHTTPTLS "${splitUlPort}" "${email}-${splitSuffix}" "$(echo "${user}" | jq -r .id)" "${splitUlAddr}" "${path}" "${extraJSON}" "${splitUlSni}"
                         echo
                         i=$((i + 1))
                     done
@@ -10437,7 +10457,17 @@ addXHTTPSplitEntry() {
         return
     fi
 
-    read -r -p "请输入配置后缀名称（如: CF下行）:" splitSuffix
+    # 获取默认域名（可能来自 sing-box 或 TLS 证书）
+    local defaultHost="${currentHost}"
+    if [[ -z "${defaultHost}" ]]; then
+        local certFile
+        certFile=$(find /etc/v2ray-agent/tls/ -name "*.crt" -not -name "*.key" 2>/dev/null | head -1)
+        if [[ -n "${certFile}" ]]; then
+            defaultHost=$(basename "${certFile}" .crt)
+        fi
+    fi
+
+    read -r -p "请输入配置后缀名称（如: hkg-cft）:" splitSuffix
     if [[ -z "${splitSuffix}" ]]; then
         echoContent red " ---> 名称不能为空"
         return
@@ -10452,12 +10482,24 @@ addXHTTPSplitEntry() {
         fi
     fi
 
+    echoContent skyBlue "\n===== 上行配置（中转/反代服务器） ====="
     read -r -p "请输入上行地址（中转服务器IP/域名）:" splitUlAddr
     if [[ -z "${splitUlAddr}" ]]; then
         echoContent red " ---> 上行地址不能为空"
         return
     fi
 
+    read -r -p "请输入上行端口[默认:${xrayVLESSXHTTPTLSPort}]:" splitUlPort
+    if [[ -z "${splitUlPort}" ]]; then
+        splitUlPort=${xrayVLESSXHTTPTLSPort}
+    fi
+
+    read -r -p "请输入上行SNI[默认:${defaultHost}]:" splitUlSni
+    if [[ -z "${splitUlSni}" ]]; then
+        splitUlSni="${defaultHost}"
+    fi
+
+    echoContent skyBlue "\n===== 下行配置（CDN） ====="
     read -r -p "请输入下行地址（CDN优选IP/域名）:" splitDlAddr
     if [[ -z "${splitDlAddr}" ]]; then
         echoContent red " ---> 下行地址不能为空"
@@ -10469,23 +10511,23 @@ addXHTTPSplitEntry() {
         splitDlPort=443
     fi
 
-    read -r -p "请输入下行SNI（如: d123456.cloudfront.net）:" splitDlSni
+    read -r -p "请输入下行SNI[默认:${defaultHost}]:" splitDlSni
     if [[ -z "${splitDlSni}" ]]; then
-        echoContent red " ---> 下行SNI不能为空"
-        return
+        splitDlSni="${defaultHost}"
     fi
 
     if [[ ! -f "${xhttpSplitConfigFile}" ]] || [[ -z "$(cat "${xhttpSplitConfigFile}" 2>/dev/null)" ]]; then
         echo '{"entries":[]}' >"${xhttpSplitConfigFile}"
     fi
 
-    local newEntry="{\"suffix\":\"${splitSuffix}\",\"ul_address\":\"${splitUlAddr}\",\"dl_address\":\"${splitDlAddr}\",\"dl_port\":${splitDlPort},\"dl_sni\":\"${splitDlSni}\"}"
+    local newEntry="{\"suffix\":\"${splitSuffix}\",\"ul_address\":\"${splitUlAddr}\",\"ul_port\":${splitUlPort},\"ul_sni\":\"${splitUlSni}\",\"dl_address\":\"${splitDlAddr}\",\"dl_port\":${splitDlPort},\"dl_sni\":\"${splitDlSni}\"}"
     local updated
     updated=$(jq ".entries += [${newEntry}]" "${xhttpSplitConfigFile}")
     echo "${updated}" | jq . >"${xhttpSplitConfigFile}"
 
     echoContent green " ---> 添加成功: ${splitSuffix}"
-    echoContent green "      上行: ${splitUlAddr} | 下行: ${splitDlAddr}:${splitDlPort} SNI:${splitDlSni}"
+    echoContent green "      上行: ${splitUlAddr}:${splitUlPort} (SNI: ${splitUlSni})"
+    echoContent green "      下行: ${splitDlAddr}:${splitDlPort} (SNI: ${splitDlSni})"
 
     read -r -p "是否立即更新订阅？[y/n]:" updateSubStatus
     if [[ "${updateSubStatus}" == "y" ]]; then
@@ -10507,13 +10549,17 @@ showXHTTPSplitEntries() {
     echoContent skyBlue "\n当前XHTTP上下行分离配置:"
     local i=0
     while [[ ${i} -lt ${entryCount} ]]; do
-        local suffix ulAddr dlAddr dlPort dlSni
+        local suffix ulAddr ulPort ulSni dlAddr dlPort dlSni
         suffix=$(jq -r ".entries[${i}].suffix" "${xhttpSplitConfigFile}")
         ulAddr=$(jq -r ".entries[${i}].ul_address" "${xhttpSplitConfigFile}")
+        ulPort=$(jq -r ".entries[${i}].ul_port // \"${xrayVLESSXHTTPTLSPort}\"" "${xhttpSplitConfigFile}")
+        ulSni=$(jq -r ".entries[${i}].ul_sni // \"--\"" "${xhttpSplitConfigFile}")
         dlAddr=$(jq -r ".entries[${i}].dl_address" "${xhttpSplitConfigFile}")
         dlPort=$(jq -r ".entries[${i}].dl_port" "${xhttpSplitConfigFile}")
         dlSni=$(jq -r ".entries[${i}].dl_sni" "${xhttpSplitConfigFile}")
-        echoContent green "  $((i + 1)). [${suffix}] 上行:${ulAddr} 下行:${dlAddr}:${dlPort} SNI:${dlSni}"
+        echoContent green "  $((i + 1)). [${suffix}]"
+        echoContent green "     上行: ${ulAddr}:${ulPort} (SNI: ${ulSni})"
+        echoContent green "     下行: ${dlAddr}:${dlPort} (SNI: ${dlSni})"
         i=$((i + 1))
     done
 }
