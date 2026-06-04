@@ -5121,6 +5121,10 @@ EOF
       path: /${path}
       host: ${ulSni}
       mode: stream-up
+      reuse-settings:
+        max-concurrency: "16-32"
+        h-max-request-times: "600-900"
+        h-max-reusable-secs: "1800-3000"
       download-settings:
         path: ${dlPath}
         host: ${dlSni}
@@ -5129,6 +5133,11 @@ EOF
         tls: true
         servername: ${dlSni}
         client-fingerprint: chrome
+        alpn: [h2]
+        reuse-settings:
+          max-concurrency: "16-32"
+          h-max-request-times: "600-900"
+          h-max-reusable-secs: "1800-3000"
 EOF
         else
             cat <<EOF >>"/etc/v2ray-agent/subscribe_local/clashMeta/${user}"
@@ -5147,6 +5156,10 @@ EOF
     xhttp-opts:
       path: /${path}
       host: ${xhttpHost}
+      reuse-settings:
+        max-concurrency: "16-32"
+        h-max-request-times: "600-900"
+        h-max-reusable-secs: "1800-3000"
 EOF
         fi
 
