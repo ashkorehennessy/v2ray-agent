@@ -5068,6 +5068,7 @@ EOF
         local extraParam=""
         local extraJSON="$7"
         local ulSni="${8:-${currentHost}}"
+        local ulAlpn="${9:-h2}"
         if [[ -n "${extraJSON}" ]]; then
             extraParam="&extra=$(echo "${extraJSON}" | jq -c . | jq -sRr @uri)"
         fi
@@ -5088,13 +5089,21 @@ EOF
             [[ -n "${certFile}" ]] && xhttpHost=$(basename "${certFile}" .crt)
         fi
 
+        local alpnParam="&alpn=${ulAlpn}"
+        local yamlAlpn="[h2]"
+        if [[ "${ulAlpn}" == "h3" ]]; then
+            yamlAlpn="[h3]"
+        elif [[ "${ulAlpn}" == "h2,h3" ]]; then
+            yamlAlpn="[h2, h3]"
+        fi
+
         echoContent yellow " ---> 通用格式(VLESS+XHTTP+TLS)"
-        echoContent green "    vless://${id}@${add}:${port}?encryption=none&security=tls&type=xhttp&sni=${ulSni}&host=${ulSni}&fp=chrome&path=${path}${modeParam}${extraParam}#${email}\n"
+        echoContent green "    vless://${id}@${add}:${port}?encryption=none&security=tls&type=xhttp&sni=${ulSni}&host=${ulSni}&fp=chrome&path=${path}${modeParam}${alpnParam}${extraParam}#${email}\n"
 
         echoContent yellow " ---> 格式化明文(VLESS+XHTTP+TLS)"
-        echoContent green "协议类型:VLESS TLS，地址:${add}，端口:${port}，路径：${path}，SNI:${ulSni}，用户ID:${id}，传输方式:xhttp(${modeDisplay})，账户名:${email}\n"
+        echoContent green "协议类型:VLESS TLS，地址:${add}，端口:${port}，路径：${path}，SNI:${ulSni}，用户ID:${id}，传输方式:xhttp(${modeDisplay})，ALPN: ${ulAlpn}，账户名:${email}\n"
         cat <<EOF >>"/etc/v2ray-agent/subscribe_local/default/${user}"
-vless://${id}@${add}:${port}?encryption=none&security=tls&type=xhttp&sni=${ulSni}&host=${ulSni}&fp=chrome&path=${path}${modeParam}${extraParam}#${email}
+vless://${id}@${add}:${port}?encryption=none&security=tls&type=xhttp&sni=${ulSni}&host=${ulSni}&fp=chrome&path=${path}${modeParam}${alpnParam}${extraParam}#${email}
 EOF
 
         # clashMeta/mihomo subscription
@@ -5113,7 +5122,7 @@ EOF
     udp: true
     tls: true
     network: xhttp
-    alpn: [h2]
+    alpn: ${yamlAlpn}
     servername: ${ulSni}
     client-fingerprint: chrome
     encryption: ""
@@ -5842,25 +5851,27 @@ showAccounts() {
                 if [[ -n "${splitEntryCount}" && "${splitEntryCount}" -gt 0 ]]; then
                     local i=0
                     while [[ ${i} -lt ${splitEntryCount} ]]; do
-                        local splitSuffix splitUlAddr splitUlPort splitUlSni splitDlAddr splitDlPort splitDlSni
+                        local splitSuffix splitUlAddr splitUlPort splitUlSni splitUlAlpn splitDlAddr splitDlPort splitDlSni
                         splitSuffix=$(jq -r ".entries[${i}].suffix" "${xhttpSplitConfigFile}")
                         splitUlAddr=$(jq -r ".entries[${i}].ul_address" "${xhttpSplitConfigFile}")
                         splitUlPort=$(jq -r ".entries[${i}].ul_port" "${xhttpSplitConfigFile}")
                         splitUlSni=$(jq -r ".entries[${i}].ul_sni" "${xhttpSplitConfigFile}")
+                        splitUlAlpn=$(jq -r ".entries[${i}].ul_alpn" "${xhttpSplitConfigFile}")
                         splitDlAddr=$(jq -r ".entries[${i}].dl_address" "${xhttpSplitConfigFile}")
                         splitDlPort=$(jq -r ".entries[${i}].dl_port" "${xhttpSplitConfigFile}")
                         splitDlSni=$(jq -r ".entries[${i}].dl_sni" "${xhttpSplitConfigFile}")
 
-                        # 兼容旧配置（无 ul_port/ul_sni 字段）
+                        # 兼容旧配置（无 ul_port/ul_sni/ul_alpn 字段）
                         [[ "${splitUlPort}" == "null" || -z "${splitUlPort}" ]] && splitUlPort="${xrayVLESSXHTTPTLSPort}"
                         [[ "${splitUlSni}" == "null" || -z "${splitUlSni}" ]] && splitUlSni="${currentHost}"
+                        [[ "${splitUlAlpn}" == "null" || -z "${splitUlAlpn}" ]] && splitUlAlpn="h2"
 
                         local extraJSON="{\"downloadSettings\":{\"address\":\"${splitDlAddr}\",\"port\":${splitDlPort},\"network\":\"xhttp\",\"security\":\"tls\",\"tlsSettings\":{\"serverName\":\"${splitDlSni}\"},\"xhttpSettings\":{\"path\":\"/${path}\"}}}"
 
                         echoContent skyBlue "\n ---> 账号:${email}-${splitSuffix} [上下行分离]"
-                        echoContent green "    上行: ${splitUlAddr}:${splitUlPort} (SNI: ${splitUlSni})"
+                        echoContent green "    上行: ${splitUlAddr}:${splitUlPort} (SNI: ${splitUlSni}, ALPN: ${splitUlAlpn})"
                         echoContent green "    下行: ${splitDlAddr}:${splitDlPort} (SNI: ${splitDlSni})"
-                        defaultBase64Code vlessXHTTPTLS "${splitUlPort}" "${email}-${splitSuffix}" "$(echo "${user}" | jq -r .id)" "${splitUlAddr}" "${path}" "${extraJSON}" "${splitUlSni}"
+                        defaultBase64Code vlessXHTTPTLS "${splitUlPort}" "${email}-${splitSuffix}" "$(echo "${user}" | jq -r .id)" "${splitUlAddr}" "${path}" "${extraJSON}" "${splitUlSni}" "${splitUlAlpn}"
                         echo
                         i=$((i + 1))
                     done
@@ -10512,6 +10523,15 @@ addXHTTPSplitEntry() {
         splitUlSni="${defaultHost}"
     fi
 
+    echoContent yellow "请选择上行ALPN: [1:h2, 2:h3, 3:h2,h3, 默认:1]"
+    read -r -p "请选择:" splitUlAlpnSelect
+    local splitUlAlpn="h2"
+    if [[ "${splitUlAlpnSelect}" == "2" ]]; then
+        splitUlAlpn="h3"
+    elif [[ "${splitUlAlpnSelect}" == "3" ]]; then
+        splitUlAlpn="h2,h3"
+    fi
+
     echoContent skyBlue "\n===== 下行配置（CDN） ====="
     read -r -p "请输入下行地址（CDN优选IP/域名）:" splitDlAddr
     if [[ -z "${splitDlAddr}" ]]; then
@@ -10533,13 +10553,13 @@ addXHTTPSplitEntry() {
         echo '{"entries":[]}' >"${xhttpSplitConfigFile}"
     fi
 
-    local newEntry="{\"suffix\":\"${splitSuffix}\",\"ul_address\":\"${splitUlAddr}\",\"ul_port\":${splitUlPort},\"ul_sni\":\"${splitUlSni}\",\"dl_address\":\"${splitDlAddr}\",\"dl_port\":${splitDlPort},\"dl_sni\":\"${splitDlSni}\"}"
+    local newEntry="{\"suffix\":\"${splitSuffix}\",\"ul_address\":\"${splitUlAddr}\",\"ul_port\":${splitUlPort},\"ul_sni\":\"${splitUlSni}\",\"ul_alpn\":\"${splitUlAlpn}\",\"dl_address\":\"${splitDlAddr}\",\"dl_port\":${splitDlPort},\"dl_sni\":\"${splitDlSni}\"}"
     local updated
     updated=$(jq ".entries += [${newEntry}]" "${xhttpSplitConfigFile}")
     echo "${updated}" | jq . >"${xhttpSplitConfigFile}"
 
     echoContent green " ---> 添加成功: ${splitSuffix}"
-    echoContent green "      上行: ${splitUlAddr}:${splitUlPort} (SNI: ${splitUlSni})"
+    echoContent green "      上行: ${splitUlAddr}:${splitUlPort} (SNI: ${splitUlSni}, ALPN: ${splitUlAlpn})"
     echoContent green "      下行: ${splitDlAddr}:${splitDlPort} (SNI: ${splitDlSni})"
 
     read -r -p "是否立即更新订阅？[y/n]:" updateSubStatus
@@ -10562,16 +10582,17 @@ showXHTTPSplitEntries() {
     echoContent skyBlue "\n当前XHTTP上下行分离配置:"
     local i=0
     while [[ ${i} -lt ${entryCount} ]]; do
-        local suffix ulAddr ulPort ulSni dlAddr dlPort dlSni
+        local suffix ulAddr ulPort ulSni ulAlpn dlAddr dlPort dlSni
         suffix=$(jq -r ".entries[${i}].suffix" "${xhttpSplitConfigFile}")
         ulAddr=$(jq -r ".entries[${i}].ul_address" "${xhttpSplitConfigFile}")
         ulPort=$(jq -r ".entries[${i}].ul_port // \"${xrayVLESSXHTTPTLSPort}\"" "${xhttpSplitConfigFile}")
         ulSni=$(jq -r ".entries[${i}].ul_sni // \"--\"" "${xhttpSplitConfigFile}")
+        ulAlpn=$(jq -r ".entries[${i}].ul_alpn // \"h2\"" "${xhttpSplitConfigFile}")
         dlAddr=$(jq -r ".entries[${i}].dl_address" "${xhttpSplitConfigFile}")
         dlPort=$(jq -r ".entries[${i}].dl_port" "${xhttpSplitConfigFile}")
         dlSni=$(jq -r ".entries[${i}].dl_sni" "${xhttpSplitConfigFile}")
         echoContent green "  $((i + 1)). [${suffix}]"
-        echoContent green "     上行: ${ulAddr}:${ulPort} (SNI: ${ulSni})"
+        echoContent green "     上行: ${ulAddr}:${ulPort} (SNI: ${ulSni}, ALPN: ${ulAlpn})"
         echoContent green "     下行: ${dlAddr}:${dlPort} (SNI: ${dlSni})"
         i=$((i + 1))
     done
@@ -10759,6 +10780,7 @@ manageXHTTP() {
         echoContent yellow "1.安装"
     fi
     echoContent yellow "4.配置上行Nginx反代[在中转机上执行]"
+    echoContent yellow "5.配置源站Nginx支持HTTP/3并反代到Xray[在源站上执行]"
     echoContent red "=============================================================="
     read -r -p "请选择:" installXHTTPStatus
     if [[ "${installXHTTPStatus}" == "1" ]]; then
@@ -10769,6 +10791,8 @@ manageXHTTP() {
         manageXHTTPSplit
     elif [[ "${installXHTTPStatus}" == "4" ]]; then
         setupXHTTPNginxProxy
+    elif [[ "${installXHTTPStatus}" == "5" ]]; then
+        setupLocalNginxH3
     fi
 }
 
@@ -11048,6 +11072,236 @@ removeXHTTPNginxProxy() {
     rm -f "${proxyInfoFile}"
     nginx -s reload 2>/dev/null
     echoContent green " ---> XHTTP Nginx反代配置已卸载"
+}
+
+# 配置本机Nginx支持HTTP/3并反代XHTTP到Xray
+setupLocalNginxH3() {
+    echoContent skyBlue "\n===== 配置源站Nginx支持HTTP/3并反代到Xray ====="
+    echoContent red "=============================================================="
+    echoContent yellow "# 说明"
+    echoContent yellow "# 此功能在源站服务器上执行（Sing-box/Xray所在机器）"
+    echoContent yellow "# 配置本地Nginx订阅端口监听HTTP/3并分流转发至本地Xray"
+    echoContent red "=============================================================="
+
+    echoContent yellow "1.安装/启用本机Nginx HTTP/3与分流反代"
+    echoContent yellow "2.查看配置状态"
+    echoContent yellow "3.关闭本机Nginx HTTP/3与分流反代"
+    echoContent yellow "0.返回"
+    read -r -p "请选择:" localAction
+    case ${localAction} in
+    1)
+        installLocalNginxH3
+        ;;
+    2)
+        showLocalNginxH3
+        ;;
+    3)
+        removeLocalNginxH3
+        ;;
+    *)
+        return
+        ;;
+    esac
+}
+
+# 安装本地Nginx H3配置
+installLocalNginxH3() {
+    if [[ ! -f "${nginxConfigPath}subscribe.conf" ]]; then
+        echoContent red " ---> 未检测到 ${nginxConfigPath}subscribe.conf，请先开启订阅功能以创建Nginx基础配置"
+        return
+    fi
+
+    # 检查 Xray XHTTP 协议是否已安装
+    if [[ ! -f "/etc/v2ray-agent/xray/conf/14_VLESS_XHTTP_TLS_inbounds.json" ]]; then
+        echoContent red " ---> 未检测到 VLESS+XHTTP+TLS 协议，请先安装该协议"
+        return
+    fi
+
+    # 提取订阅配置参数
+    local subPort subDomain sslCert sslKey staticRoot hasIPv6="false"
+    subPort=$(grep -oE 'listen\s+[^;]+' "${nginxConfigPath}subscribe.conf" | grep -v '\[::\]' | grep -oE '[0-9]+' | head -1)
+    subDomain=$(grep -oE 'server_name\s+[^;]+' "${nginxConfigPath}subscribe.conf" | head -1 | awk '{print $2}')
+    sslCert=$(grep -oE 'ssl_certificate\s+[^;]+' "${nginxConfigPath}subscribe.conf" | head -1 | awk '{print $2}')
+    sslKey=$(grep -oE 'ssl_certificate_key\s+[^;]+' "${nginxConfigPath}subscribe.conf" | head -1 | awk '{print $2}')
+    staticRoot=$(grep -oE 'root\s+[^;]+' "${nginxConfigPath}subscribe.conf" | head -1 | awk '{print $2}')
+
+    if grep -q "listen\s+\[::\]" "${nginxConfigPath}subscribe.conf"; then
+        hasIPv6="true"
+    fi
+
+    if [[ -z "${subPort}" || -z "${subDomain}" ]]; then
+        echoContent red " ---> 无法解析 subscribe.conf，请确认其格式"
+        return
+    fi
+
+    # 提取 Xray 配置参数
+    local xrayPort xrayPath
+    xrayPort=$(jq -r .inbounds[0].port "/etc/v2ray-agent/xray/conf/14_VLESS_XHTTP_TLS_inbounds.json")
+    xrayPath=$(jq -r .inbounds[0].streamSettings.xhttpSettings.path "/etc/v2ray-agent/xray/conf/14_VLESS_XHTTP_TLS_inbounds.json")
+    if [[ "${xrayPath:0:1}" != "/" ]]; then
+        xrayPath="/${xrayPath}"
+    fi
+
+    # 备份当前配置
+    cp "${nginxConfigPath}subscribe.conf" "${nginxConfigPath}subscribe.conf.bak"
+
+    # 生成支持 H3 / QUIC 及 XHTTP 分流反代的配置
+    # 修复了 IPv6 的 H2 丢失问题
+    local ipv6Listen=""
+    if [[ "${hasIPv6}" == "true" ]]; then
+        ipv6Listen="listen [::]:${subPort} ssl so_keepalive=on;
+    listen [::]:${subPort} quic reuseport;"
+    fi
+
+    cat <<EOF >"${nginxConfigPath}subscribe.conf"
+server {
+    # 👑 修复1：补回 TCP 的 keepalive 和全局 HTTP/2 支持
+    listen ${subPort} ssl so_keepalive=on;
+    http2 on;
+    listen ${subPort} quic reuseport;
+    ${ipv6Listen}
+    server_name ${subDomain};
+    ssl_certificate ${sslCert};
+    ssl_certificate_key ${sslKey};
+    ssl_protocols              TLSv1.2 TLSv1.3;
+    ssl_ciphers                TLS13_AES_128_GCM_SHA256:TLS13_AES_256_GCM_SHA384:TLS13_CHACHA20_POLY1305_SHA256:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305;
+    ssl_prefer_server_ciphers  on;
+
+    # H3 Alt-Svc
+    add_header Alt-Svc 'h3=":${subPort}"; ma=86400';
+
+    resolver                   1.1.1.1 valid=60s;
+    resolver_timeout           2s;
+    client_max_body_size 100m;
+    root ${staticRoot};
+
+    location ~ ^/s/(clashMeta|default|clashMetaProfiles|sing-box|sing-box_profiles)/(.*) {
+        default_type 'text/plain; charset=utf-8';
+        alias /etc/v2ray-agent/subscribe/\$1/\$2;
+    }
+
+    # XHTTP_GRPC_PROXY_START
+    location ${xrayPath} {
+        grpc_pass grpcs://127.0.0.1:${xrayPort};
+        grpc_ssl_server_name on;
+        grpc_ssl_name ${subDomain};
+        grpc_ssl_protocols TLSv1.3;
+        grpc_read_timeout 3600s;
+        grpc_send_timeout 3600s;
+        grpc_set_header Host ${subDomain};
+        
+        # 👑 修复2：彻底放行流式上行的 Payload 体积，防止断流
+        client_max_body_size 0;
+    }
+    # XHTTP_GRPC_PROXY_END
+
+    location / {
+    }
+}
+EOF
+
+    # 测试 Nginx 配置
+    local nginxTestResult
+    nginxTestResult=$(nginx -t 2>&1)
+    if echo "${nginxTestResult}" | grep -q "successful"; then
+        allowPort "${subPort}" "udp"
+        nginx -s reload 2>/dev/null
+        echoContent green "\n ---> 源站Nginx HTTP/3 及 XHTTP 卸载反代配置成功！"
+        echoContent green "=============================================================="
+        echoContent green "  监听端口: ${subPort} (TCP/UDP)"
+        echoContent green "  反代路径: ${xrayPath} -> 本地Xray端口 ${xrayPort}"
+        echoContent green "  H3 Alt-Svc引流已生效"
+        echoContent green "=============================================================="
+    else
+        echoContent red "\n ---> Nginx配置测试失败，已回滚原始配置！"
+        echo "${nginxTestResult}"
+        mv "${nginxConfigPath}subscribe.conf.bak" "${nginxConfigPath}subscribe.conf"
+    fi
+}
+
+# 显示本地Nginx H3状态
+showLocalNginxH3() {
+    if [[ ! -f "${nginxConfigPath}subscribe.conf" ]]; then
+        echoContent yellow " ---> 未安装订阅/Nginx配置"
+        return
+    fi
+
+    if grep -q "quic" "${nginxConfigPath}subscribe.conf"; then
+        echoContent green " ---> 本地Nginx HTTP/3 支持状态: 已启用"
+        local subPort
+        subPort=$(grep -oE 'listen\s+[^;]+' "${nginxConfigPath}subscribe.conf" | grep -v '\[::\]' | grep -oE '[0-9]+' | head -1)
+        echoContent green "  监听端口: ${subPort} (UDP/QUIC)"
+        if grep -q "grpc_pass" "${nginxConfigPath}subscribe.conf"; then
+            local xrayPort xrayPath
+            xrayPort=$(grep "grpc_pass" "${nginxConfigPath}subscribe.conf" | grep -oE '[0-9]+' | head -1)
+            xrayPath=$(grep -E 'location\s+/[a-zA-Z0-9_-]+' "${nginxConfigPath}subscribe.conf" | grep -v 'location ~' | head -1 | awk '{print $2}')
+            echoContent green "  XHTTP分流路径: ${xrayPath} -> 转发到 ${xrayPort}"
+        fi
+    else
+        echoContent yellow " ---> 本地Nginx HTTP/3 支持状态: 未启用"
+    fi
+}
+
+# 还原本地Nginx配置
+removeLocalNginxH3() {
+    if [[ ! -f "${nginxConfigPath}subscribe.conf" ]]; then
+        echoContent yellow " ---> 未安装订阅/Nginx配置"
+        return
+    fi
+
+    if ! grep -q "quic" "${nginxConfigPath}subscribe.conf"; then
+        echoContent yellow " ---> 未启用HTTP/3配置"
+        return
+    fi
+
+    read -r -p "确认还原订阅端口的 Nginx HTTP/3 及分流配置吗？[y/n]:" confirmRemove
+    if [[ "${confirmRemove}" != "y" ]]; then
+        return
+    fi
+
+    # 提取当前参数以重建标准配置
+    local subPort subDomain sslCert sslKey staticRoot hasIPv6="false"
+    subPort=$(grep -oE 'listen\s+[^;]+' "${nginxConfigPath}subscribe.conf" | grep -v '\[::\]' | grep -oE '[0-9]+' | head -1)
+    subDomain=$(grep -oE 'server_name\s+[^;]+' "${nginxConfigPath}subscribe.conf" | head -1 | awk '{print $2}')
+    sslCert=$(grep -oE 'ssl_certificate\s+[^;]+' "${nginxConfigPath}subscribe.conf" | head -1 | awk '{print $2}')
+    sslKey=$(grep -oE 'ssl_certificate_key\s+[^;]+' "${nginxConfigPath}subscribe.conf" | head -1 | awk '{print $2}')
+    staticRoot=$(grep -oE 'root\s+[^;]+' "${nginxConfigPath}subscribe.conf" | head -1 | awk '{print $2}')
+
+    if grep -q "listen\s+\[::\]" "${nginxConfigPath}subscribe.conf"; then
+        hasIPv6="true"
+    fi
+
+    local ipv6Listen=""
+    if [[ "${hasIPv6}" == "true" ]]; then
+        ipv6Listen="listen [::]:${subPort} ssl so_keepalive=on;http2 on;"
+    fi
+
+    cat <<EOF >"${nginxConfigPath}subscribe.conf"
+server {
+    listen ${subPort} ssl so_keepalive=on;http2 on;
+    ${ipv6Listen}
+    server_name ${subDomain};
+    ssl_certificate ${sslCert};
+    ssl_certificate_key ${sslKey};
+    ssl_protocols              TLSv1.2 TLSv1.3;
+    ssl_ciphers                TLS13_AES_128_GCM_SHA256:TLS13_AES_256_GCM_SHA384:TLS13_CHACHA20_POLY1305_SHA256:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305;
+    ssl_prefer_server_ciphers  on;
+
+    resolver                   1.1.1.1 valid=60s;
+    resolver_timeout           2s;
+    client_max_body_size 100m;
+    root ${staticRoot};
+    location ~ ^/s/(clashMeta|default|clashMetaProfiles|sing-box|sing-box_profiles)/(.*) {
+        default_type 'text/plain; charset=utf-8';
+        alias /etc/v2ray-agent/subscribe/\$1/\$2;
+    }
+    location / {
+    }
+}
+EOF
+
+    nginx -s reload 2>/dev/null
+    echoContent green " ---> 已成功还原 Nginx 订阅配置且关闭 HTTP/3 及分流功能"
 }
 
 # hysteria管理
