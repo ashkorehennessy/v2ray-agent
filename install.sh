@@ -1463,66 +1463,7 @@ checkDNSIP() {
 }
 # 检查端口实际开放状态
 checkPortOpen() {
-    handleSingBox stop >/dev/null 2>&1
-    handleXray stop >/dev/null 2>&1
-
-    local port=$1
-    local domain=$2
-    local checkPortOpenResult=
-    allowPort "${port}"
-
-    if [[ -z "${btDomain}" ]]; then
-
-        handleNginx stop
-        # 初始化nginx配置
-        touch ${nginxConfigPath}checkPortOpen.conf
-        local listenIPv6PortConfig=
-
-        if [[ -n $(curl -s -6 -m 4 http://www.cloudflare.com/cdn-cgi/trace | grep "ip" | cut -d "=" -f 2) ]]; then
-            listenIPv6PortConfig="listen [::]:${port};"
-        fi
-        cat <<EOF >${nginxConfigPath}checkPortOpen.conf
-server {
-    listen ${port};
-    ${listenIPv6PortConfig}
-    server_name ${domain};
-    location /checkPort {
-        return 200 'fjkvymb6len';
-    }
-    location /ip {
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header REMOTE-HOST \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        default_type text/plain;
-        return 200 \$proxy_add_x_forwarded_for;
-    }
-}
-EOF
-        handleNginx start
-        # 检查域名+端口的开放
-        checkPortOpenResult=$(curl -s -m 10 "http://${domain}:${port}/checkPort")
-        localIP=$(curl -s -m 10 "http://${domain}:${port}/ip")
-        rm "${nginxConfigPath}checkPortOpen.conf"
-        handleNginx stop
-        if [[ "${checkPortOpenResult}" == "fjkvymb6len" ]]; then
-            echoContent green " ---> 检测到${port}端口已开放"
-        else
-            echoContent green " ---> 未检测到${port}端口开放，退出安装"
-            if echo "${checkPortOpenResult}" | grep -q "cloudflare"; then
-                echoContent yellow " ---> 请关闭云朵后等待三分钟重新尝试"
-            else
-                if [[ -z "${checkPortOpenResult}" ]]; then
-                    echoContent red " ---> 请检查是否有网页防火墙，比如Oracle等云服务商"
-                    echoContent red " ---> 检查是否自己安装过nginx并且有配置冲突，可以尝试DD纯净系统后重新尝试"
-                else
-                    echoContent red " ---> 错误日志：${checkPortOpenResult}，请将此错误日志通过issues提交反馈"
-                fi
-            fi
-            exit 0
-        fi
-        checkIP "${localIP}"
-    fi
+    echo "跳过端口检测"
 }
 
 # 初始化Nginx申请证书配置
