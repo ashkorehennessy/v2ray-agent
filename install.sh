@@ -8170,6 +8170,16 @@ setSocks5OutboundRoutingAll() {
             removeXrayOutbound wireguard_out_IPv6
 
             rm ${configPath}09_routing.json >/dev/null 2>&1
+        elif [[ -f "/etc/v2ray-agent/xray/xray" ]] && [[ -d "/etc/v2ray-agent/xray/conf" ]]; then
+            # 双内核模式：也清理 xray-core 的出站和路由配置
+            removeXrayOutbound IPv4_out
+            removeXrayOutbound IPv6_out
+            removeXrayOutbound z_direct_outbound
+            removeXrayOutbound blackhole_out
+            removeXrayOutbound wireguard_out_IPv4
+            removeXrayOutbound wireguard_out_IPv6
+
+            rm /etc/v2ray-agent/xray/conf/09_routing.json >/dev/null 2>&1
         fi
         if [[ -n "${singBoxConfigPath}" ]]; then
 
@@ -8238,6 +8248,11 @@ removeSocks5Routing() {
             unInstallRouting socks5_outbound outboundTag
 
             addXrayOutbound z_direct_outbound
+        elif [[ -f "/etc/v2ray-agent/xray/xray" ]] && [[ -d "/etc/v2ray-agent/xray/conf" ]]; then
+            # 双内核模式：也清理 xray-core 的 socks5 出站
+            removeXrayOutbound socks5_outbound
+            rm /etc/v2ray-agent/xray/conf/09_routing.json >/dev/null 2>&1
+            addXrayOutbound z_direct_outbound
         fi
 
         if [[ -n "${singBoxConfigPath}" ]]; then
@@ -8259,6 +8274,11 @@ removeSocks5Routing() {
         if [[ "${coreInstallType}" == "1" ]]; then
             removeXrayOutbound socks5_outbound
             unInstallRouting socks5_outbound outboundTag
+            addXrayOutbound z_direct_outbound
+        elif [[ -f "/etc/v2ray-agent/xray/xray" ]] && [[ -d "/etc/v2ray-agent/xray/conf" ]]; then
+            # 双内核模式：也清理 xray-core 的 socks5 出站
+            removeXrayOutbound socks5_outbound
+            rm /etc/v2ray-agent/xray/conf/09_routing.json >/dev/null 2>&1
             addXrayOutbound z_direct_outbound
         fi
 
@@ -8509,13 +8529,16 @@ EOF
     fi
     if [[ "${coreInstallType}" == "1" ]]; then
         addXrayOutbound socks5_outbound
+    elif [[ -f "/etc/v2ray-agent/xray/xray" ]] && [[ -d "/etc/v2ray-agent/xray/conf" ]]; then
+        # 双内核模式：sing-box 为主核心，但 xray-core 也已安装，需同时生成 xray 的 socks5 出站配置
+        addXrayOutbound socks5_outbound
     fi
 }
 
 # socks5 outbound routing规则
 setSocks5OutboundRouting() {
 
-    if [[ "$1" == "addRules" && ! -f "${singBoxConfigPath}socks5_01_outbound_route.json" && ! -f "${configPath}09_routing.json" ]]; then
+    if [[ "$1" == "addRules" && ! -f "${singBoxConfigPath}socks5_01_outbound_route.json" && ! -f "${configPath}09_routing.json" && ! -f "/etc/v2ray-agent/xray/conf/09_routing.json" ]]; then
         echoContent red " ---> 请安装出站分流后再添加分流规则"
         exit 0
     fi
@@ -8535,9 +8558,22 @@ setSocks5OutboundRouting() {
     addSingBoxRouteRule "socks5_outbound" "${socks5RoutingOutboundDomain}" "socks5_01_outbound_route"
     addSingBoxOutbound "01_direct_outbound"
 
+    # 确定 xray 配置路径：主核心时使用 configPath，双内核时使用 xray 固定路径
+    local xrayConfPath=""
     if [[ "${coreInstallType}" == "1" ]]; then
+        xrayConfPath="${configPath}"
+    elif [[ -f "/etc/v2ray-agent/xray/xray" ]] && [[ -d "/etc/v2ray-agent/xray/conf" ]]; then
+        xrayConfPath="/etc/v2ray-agent/xray/conf/"
+    fi
 
-        unInstallRouting "socks5_outbound" "outboundTag"
+    if [[ -n "${xrayConfPath}" ]]; then
+
+        # 清理旧的 socks5 路由规则
+        if [[ -f "${xrayConfPath}09_routing.json" ]]; then
+            local routing=
+            routing=$(jq -r 'del(.routing.rules[] | select(.outboundTag == "socks5_outbound" and (.protocol == null)))' "${xrayConfPath}09_routing.json")
+            echo "${routing}" | jq . >"${xrayConfPath}09_routing.json"
+        fi
         local domainRules=[]
         while read -r line; do
             if echo "${routingRule}" | grep -q "${line}"; then
@@ -8548,8 +8584,8 @@ setSocks5OutboundRouting() {
                 domainRules=$(echo "${domainRules}" | jq -r --arg rule "${matchedRuleValue}" '. += [$rule]')
             fi
         done < <(echo "${socks5RoutingOutboundDomain}" | tr ',' '\n')
-        if [[ ! -f "${configPath}09_routing.json" ]]; then
-            cat <<EOF >${configPath}09_routing.json
+        if [[ ! -f "${xrayConfPath}09_routing.json" ]]; then
+            cat <<EOF >${xrayConfPath}09_routing.json
 {
     "routing":{
         "rules": []
@@ -8557,8 +8593,8 @@ setSocks5OutboundRouting() {
 }
 EOF
         fi
-        routing=$(jq -r ".routing.rules += [{\"type\": \"field\",\"domain\": ${domainRules},\"outboundTag\": \"socks5_outbound\"}]" ${configPath}09_routing.json)
-        echo "${routing}" | jq . >${configPath}09_routing.json
+        routing=$(jq -r ".routing.rules += [{\"type\": \"field\",\"domain\": ${domainRules},\"outboundTag\": \"socks5_outbound\"}]" ${xrayConfPath}09_routing.json)
+        echo "${routing}" | jq . >${xrayConfPath}09_routing.json
     fi
 }
 
@@ -8625,8 +8661,8 @@ reloadCore() {
         handleXray stop
         handleXray start
     fi
-    # sing-box 为主核心时，如果 xray 有 XHTTP+TLS 配置也重启 xray
-    if [[ "${coreInstallType}" == "2" ]] && [[ -f "/etc/v2ray-agent/xray/conf/14_VLESS_XHTTP_TLS_inbounds.json" ]]; then
+    # sing-box 为主核心时，如果 xray 有 XHTTP+TLS 配置或 socks5 出站配置也重启 xray
+    if [[ "${coreInstallType}" == "2" ]] && [[ -f "/etc/v2ray-agent/xray/conf/14_VLESS_XHTTP_TLS_inbounds.json" || -f "/etc/v2ray-agent/xray/conf/socks5_outbound.json" ]]; then
         handleXray stop
         handleXray start
     fi
