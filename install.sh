@@ -7983,6 +7983,7 @@ routingToolsMenu() {
     echoContent yellow "5.DNS分流"
     #    echoContent yellow "6.VMess+WS+TLS分流"
     echoContent yellow "7.SNI反向代理分流"
+    echoContent yellow "8.VLESS+XHTTP+TLS分流【加密隧道，需落地机安装选项19】"
 
     read -r -p "请选择:" selectType
 
@@ -8014,6 +8015,9 @@ routingToolsMenu() {
         fi
         sniRouting 1
         ;;
+    8)
+        vlessXHTTPRouting
+        ;;
     esac
 
 }
@@ -8038,6 +8042,329 @@ vmessWSRouting() {
         ;;
     esac
 }
+# ============================================================
+# VLESS+XHTTP+TLS 分流
+# ============================================================
+
+# VLESS+XHTTP+TLS 分流主菜单
+vlessXHTTPRouting() {
+    readInstallType
+    if [[ -z "${coreInstallType}" ]]; then
+        echoContent red " ---> 未安装任意协议，请使用 1.安装 或者 2.任意组合安装 进行安装后使用"
+        exit 0
+    fi
+
+    # 必须有 xray-core 且已安装 XHTTP+TLS inbound
+    if [[ ! -f "/etc/v2ray-agent/xray/xray" ]]; then
+        echoContent red " ---> 此功能依赖 xray-core，请先通过菜单选项 19 安装 VLESS+XHTTP+TLS"
+        exit 0
+    fi
+    if [[ ! -f "/etc/v2ray-agent/xray/conf/14_VLESS_XHTTP_TLS_inbounds.json" ]]; then
+        echoContent red " ---> 未检测到 XHTTP+TLS 配置，请先通过菜单选项 19 安装 VLESS+XHTTP+TLS"
+        echoContent yellow " ---> 此功能在落地机安装 XHTTP+TLS 后，在转发机上配置出站分流以建立加密隧道"
+        exit 0
+    fi
+
+    echoContent skyBlue "\n功能 1/${totalProgress} : VLESS+XHTTP+TLS 分流"
+    echoContent red "\n=============================================================="
+    echoContent red "# 注意事项"
+    echoContent yellow "# 流量走 VLESS+XHTTP+TLS 加密隧道，支持 H2/H3 xmux 多路复用"
+    echoContent yellow "# 用于服务端之间的流量转发，可用于解锁流媒体、ChatGPT 等\n"
+    echoContent yellow "# 落地机（解锁机）需通过选项 19 安装 VLESS+XHTTP+TLS 作为入站\n"
+
+    echoContent yellow "1.出站配置"
+    echoContent yellow "2.卸载"
+    read -r -p "请选择:" selectType
+
+    case ${selectType} in
+    1)
+        vlessXHTTPOutboundMenu
+        ;;
+    2)
+        removeVlessXHTTPRouting
+        ;;
+    esac
+}
+
+# VLESS+XHTTP+TLS 出站子菜单
+vlessXHTTPOutboundMenu() {
+    echoContent skyBlue "\n功能 1/1 : VLESS+XHTTP+TLS 出站"
+    echoContent red "\n=============================================================="
+
+    echoContent yellow "1.安装出站"
+    echoContent yellow "2.设置全局转发"
+    echoContent yellow "3.查看分流规则"
+    echoContent yellow "4.添加分流规则"
+    read -r -p "请选择:" selectType
+    case ${selectType} in
+    1)
+        setVlessXHTTPOutbound
+        setVlessXHTTPOutboundRouting
+        reloadCore
+        vlessXHTTPOutboundMenu
+        ;;
+    2)
+        setVlessXHTTPOutbound
+        setVlessXHTTPOutboundRoutingAll
+        reloadCore
+        vlessXHTTPOutboundMenu
+        ;;
+    3)
+        showVlessXHTTPRoutingRules
+        vlessXHTTPOutboundMenu
+        ;;
+    4)
+        setVlessXHTTPOutboundRouting addRules
+        reloadCore
+        vlessXHTTPOutboundMenu
+        ;;
+    esac
+}
+
+# VLESS+XHTTP+TLS 出站配置生成
+setVlessXHTTPOutbound() {
+    echoContent yellow "\n==================== 配置 VLESS+XHTTP+TLS 出站（转发机） =====================\n"
+    echo
+    read -r -p "请输入落地机 IP 地址或域名:" vlessXHTTPOutboundAddress
+    if [[ -z "${vlessXHTTPOutboundAddress}" ]]; then
+        echoContent red " ---> 地址不可为空"
+        exit 0
+    fi
+
+    local defaultPort
+    defaultPort=$(jq -r '.inbounds[0].port' /etc/v2ray-agent/xray/conf/14_VLESS_XHTTP_TLS_inbounds.json 2>/dev/null)
+    echo
+    read -r -p "请输入落地机端口[默认:${defaultPort}]:" vlessXHTTPOutboundPort
+    if [[ -z "${vlessXHTTPOutboundPort}" ]]; then
+        vlessXHTTPOutboundPort="${defaultPort}"
+    fi
+    if [[ -z "${vlessXHTTPOutboundPort}" ]]; then
+        echoContent red " ---> 端口不可为空"
+        exit 0
+    fi
+
+    echo
+    read -r -p "请输入落地机的 UUID（VLESS 用户 ID）:" vlessXHTTPOutboundUUID
+    if [[ -z "${vlessXHTTPOutboundUUID}" ]]; then
+        echoContent red " ---> UUID 不可为空"
+        exit 0
+    fi
+
+    local defaultSNI
+    defaultSNI=$(jq -r '.inbounds[0].streamSettings.tlsSettings.certificates[0].certificateFile // ""' \
+        /etc/v2ray-agent/xray/conf/14_VLESS_XHTTP_TLS_inbounds.json 2>/dev/null | sed 's|/etc/v2ray-agent/tls/||;s|\.crt||')
+    echo
+    read -r -p "请输入 TLS SNI（落地机域名）[默认:${defaultSNI}]:" vlessXHTTPOutboundSNI
+    if [[ -z "${vlessXHTTPOutboundSNI}" ]]; then
+        vlessXHTTPOutboundSNI="${defaultSNI}"
+    fi
+    if [[ -z "${vlessXHTTPOutboundSNI}" ]]; then
+        echoContent red " ---> SNI 不可为空"
+        exit 0
+    fi
+
+    local defaultPath
+    defaultPath=$(jq -r '.inbounds[0].streamSettings.xhttpSettings.path // ""' \
+        /etc/v2ray-agent/xray/conf/14_VLESS_XHTTP_TLS_inbounds.json 2>/dev/null)
+    echo
+    read -r -p "请输入 XHTTP path（落地机配置中的 path）[默认:${defaultPath}]:" vlessXHTTPOutboundPath
+    if [[ -z "${vlessXHTTPOutboundPath}" ]]; then
+        vlessXHTTPOutboundPath="${defaultPath}"
+    fi
+    if [[ -z "${vlessXHTTPOutboundPath}" ]]; then
+        echoContent red " ---> path 不可为空"
+        exit 0
+    fi
+    # 确保 path 以 / 开头
+    if [[ "${vlessXHTTPOutboundPath}" != /* ]]; then
+        vlessXHTTPOutboundPath="/${vlessXHTTPOutboundPath}"
+    fi
+
+    echo
+    echoContent yellow "请选择 ALPN 协议："
+    echoContent yellow "1.h2   [默认，TCP，稳定]"
+    echoContent yellow "2.h3   [QUIC，弱网更优，需开放 UDP 端口]"
+    echoContent yellow "3.h2,h3 [自动协商]"
+    read -r -p "请选择[回车默认h2]:" vlessXHTTPAlpnSelect
+    local vlessXHTTPAlpn='["h2"]'
+    if [[ "${vlessXHTTPAlpnSelect}" == "2" ]]; then
+        vlessXHTTPAlpn='["h3"]'
+    elif [[ "${vlessXHTTPAlpnSelect}" == "3" ]]; then
+        vlessXHTTPAlpn='["h2","h3"]'
+    fi
+
+    echoContent green "\n ---> 配置信息预览"
+    echoContent green "      落地机地址  : ${vlessXHTTPOutboundAddress}"
+    echoContent green "      落地机端口  : ${vlessXHTTPOutboundPort}"
+    echoContent green "      UUID        : ${vlessXHTTPOutboundUUID}"
+    echoContent green "      SNI         : ${vlessXHTTPOutboundSNI}"
+    echoContent green "      path        : ${vlessXHTTPOutboundPath}"
+    echoContent green "      ALPN        : ${vlessXHTTPAlpn}"
+    echo
+
+    # 写入 xray 出站配置
+    cat <<EOF >/etc/v2ray-agent/xray/conf/vless_xhttp_outbound.json
+{
+  "outbounds": [
+    {
+      "protocol": "vless",
+      "tag": "vless_xhttp_outbound",
+      "settings": {
+        "vnext": [
+          {
+            "address": "${vlessXHTTPOutboundAddress}",
+            "port": ${vlessXHTTPOutboundPort},
+            "users": [
+              {
+                "id": "${vlessXHTTPOutboundUUID}",
+                "encryption": "none"
+              }
+            ]
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "xhttp",
+        "security": "tls",
+        "tlsSettings": {
+          "serverName": "${vlessXHTTPOutboundSNI}",
+          "alpn": ${vlessXHTTPAlpn}
+        },
+        "xhttpSettings": {
+          "path": "${vlessXHTTPOutboundPath}",
+          "mode": "auto"
+        }
+      }
+    }
+  ]
+}
+EOF
+    echoContent green " ---> xray VLESS+XHTTP+TLS 出站配置已生成"
+}
+
+# VLESS+XHTTP+TLS 出站分流规则（域名分流）
+setVlessXHTTPOutboundRouting() {
+    local xrayConfPath="/etc/v2ray-agent/xray/conf/"
+
+    if [[ "$1" == "addRules" && ! -f "${xrayConfPath}09_routing.json" ]]; then
+        echoContent red " ---> 请先安装出站分流后再添加规则"
+        exit 0
+    fi
+
+    echoContent red "=============================================================="
+    echoContent skyBlue "请输入要分流的域名\n"
+    echoContent yellow "支持 geosite 匹配，无法匹配则精确匹配域名\n"
+    echoContent yellow "非增量添加，会替换原有规则\n"
+    echoContent yellow "录入示例: netflix,openai,v2ray-agent.com\n"
+    read -r -p "域名:" vlessXHTTPRoutingDomain
+    if [[ -z "${vlessXHTTPRoutingDomain}" ]]; then
+        echoContent red " ---> 域名不可为空"
+        exit 0
+    fi
+
+    # 清理旧的路由规则
+    if [[ -f "${xrayConfPath}09_routing.json" ]]; then
+        local cleanedRouting=
+        cleanedRouting=$(jq -r 'del(.routing.rules[] | select(.outboundTag == "vless_xhttp_outbound" and (.protocol == null)))' "${xrayConfPath}09_routing.json")
+        echo "${cleanedRouting}" | jq . >"${xrayConfPath}09_routing.json"
+    fi
+
+    # 创建路由文件（如不存在）
+    if [[ ! -f "${xrayConfPath}09_routing.json" ]]; then
+        cat <<EOF >${xrayConfPath}09_routing.json
+{
+    "routing":{
+        "rules": []
+  }
+}
+EOF
+    fi
+
+    # 构建域名规则数组
+    local domainRules=[]
+    while read -r line; do
+        local matchedRuleValue
+        matchedRuleValue=$(getDLCMatchedRuleValue "${line}" "/etc/v2ray-agent/xray")
+        domainRules=$(echo "${domainRules}" | jq -r --arg rule "${matchedRuleValue}" '. += [$rule]')
+    done < <(echo "${vlessXHTTPRoutingDomain}" | tr ',' '\n' | grep -v '^$')
+
+    local routing=
+    routing=$(jq -r ".routing.rules += [{\"type\": \"field\",\"domain\": ${domainRules},\"outboundTag\": \"vless_xhttp_outbound\"}]" "${xrayConfPath}09_routing.json")
+    echo "${routing}" | jq . >"${xrayConfPath}09_routing.json"
+
+    echoContent green " ---> 分流规则已写入"
+}
+
+# VLESS+XHTTP+TLS 全局转发
+setVlessXHTTPOutboundRoutingAll() {
+    echoContent red "=============================================================="
+    echoContent yellow "# 注意事项\n"
+    echoContent yellow "1.会删除所有已设置的分流规则（warp、IPv6 等）"
+    echoContent yellow "2.会删除 VLESS+XHTTP+TLS 以外的所有 xray 出站规则\n"
+    read -r -p "是否确认设置？[y/n]:" vlessXHTTPGlobalStatus
+
+    if [[ "${vlessXHTTPGlobalStatus}" == "y" ]]; then
+        removeXrayOutbound IPv4_out
+        removeXrayOutbound IPv6_out
+        removeXrayOutbound z_direct_outbound
+        removeXrayOutbound blackhole_out
+        removeXrayOutbound wireguard_out_IPv4
+        removeXrayOutbound wireguard_out_IPv6
+        removeXrayOutbound socks5_outbound
+
+        rm /etc/v2ray-agent/xray/conf/09_routing.json >/dev/null 2>&1
+
+        echoContent green " ---> VLESS+XHTTP+TLS 全局出站设置完毕"
+    else
+        echoContent green " ---> 放弃设置"
+    fi
+}
+
+# 查看 VLESS+XHTTP+TLS 当前分流规则
+showVlessXHTTPRoutingRules() {
+    local xrayConfPath="/etc/v2ray-agent/xray/conf/"
+    if [[ -f "${xrayConfPath}09_routing.json" ]]; then
+        local rules=
+        rules=$(jq ".routing.rules[]|select(.outboundTag==\"vless_xhttp_outbound\")" "${xrayConfPath}09_routing.json" 2>/dev/null)
+        if [[ -n "${rules}" ]]; then
+            echoContent yellow "\nxray-core VLESS+XHTTP+TLS 分流规则："
+            echo "${rules}" | jq .
+        else
+            echoContent yellow " ---> 暂无分流规则"
+        fi
+    fi
+    if [[ -f "${xrayConfPath}vless_xhttp_outbound.json" ]]; then
+        echoContent yellow "\n出站配置："
+        jq '.outbounds[0] | {address: .settings.vnext[0].address, port: .settings.vnext[0].port, SNI: .streamSettings.tlsSettings.serverName, alpn: .streamSettings.tlsSettings.alpn, path: .streamSettings.xhttpSettings.path}' \
+            "${xrayConfPath}vless_xhttp_outbound.json"
+    else
+        echoContent yellow " ---> 未安装 VLESS+XHTTP+TLS 出站"
+    fi
+}
+
+# 卸载 VLESS+XHTTP+TLS 分流
+removeVlessXHTTPRouting() {
+    local xrayConfPath="/etc/v2ray-agent/xray/conf/"
+
+    # 删除出站配置
+    if [[ -f "${xrayConfPath}vless_xhttp_outbound.json" ]]; then
+        rm "${xrayConfPath}vless_xhttp_outbound.json" >/dev/null 2>&1
+    fi
+
+    # 清理路由规则
+    if [[ -f "${xrayConfPath}09_routing.json" ]]; then
+        local cleanedRouting=
+        cleanedRouting=$(jq -r 'del(.routing.rules[] | select(.outboundTag == "vless_xhttp_outbound" and (.protocol == null)))' "${xrayConfPath}09_routing.json")
+        echo "${cleanedRouting}" | jq . >"${xrayConfPath}09_routing.json"
+    fi
+
+    # 恢复 direct 出站
+    addXrayOutbound z_direct_outbound
+
+    echoContent green " ---> VLESS+XHTTP+TLS 分流卸载完毕"
+    reloadCore
+}
+
 # Socks5分流
 socks5Routing() {
     if [[ -z "${coreInstallType}" ]]; then
@@ -8661,8 +8988,8 @@ reloadCore() {
         handleXray stop
         handleXray start
     fi
-    # sing-box 为主核心时，如果 xray 有 XHTTP+TLS 配置或 socks5 出站配置也重启 xray
-    if [[ "${coreInstallType}" == "2" ]] && [[ -f "/etc/v2ray-agent/xray/conf/14_VLESS_XHTTP_TLS_inbounds.json" || -f "/etc/v2ray-agent/xray/conf/socks5_outbound.json" ]]; then
+    # sing-box 为主核心时，如果 xray 有 XHTTP+TLS 配置、socks5 出站或 VLESS+XHTTP 出站也重启 xray
+    if [[ "${coreInstallType}" == "2" ]] && [[ -f "/etc/v2ray-agent/xray/conf/14_VLESS_XHTTP_TLS_inbounds.json" || -f "/etc/v2ray-agent/xray/conf/socks5_outbound.json" || -f "/etc/v2ray-agent/xray/conf/vless_xhttp_outbound.json" ]]; then
         handleXray stop
         handleXray start
     fi
