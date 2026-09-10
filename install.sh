@@ -1325,10 +1325,10 @@ readConfigHostPathUUID() {
                 currentHost=$(grep 'server_name' <${nginxConfigPath}sing_box_VMess_HTTPUpgrade.conf | awk '{print $2}')
                 currentHost=${currentHost//;/}
             fi
-            currentUUID=$(jq -r .inbounds[0].users[0].uuid ${configPath}${frontingType}.json)
+            currentUUID=$(jq -r '.inbounds[0].users[0] | .uuid // .id // .password // empty' ${configPath}${frontingType}.json)
             currentClients=$(jq -r .inbounds[0].users ${configPath}${frontingType}.json)
         else
-            currentUUID=$(jq -r .inbounds[0].users[0].uuid ${configPath}${frontingTypeReality}.json)
+            currentUUID=$(jq -r '.inbounds[0].users[0] | .uuid // .id // .password // empty' ${configPath}${frontingTypeReality}.json)
             currentClients=$(jq -r .inbounds[0].users ${configPath}${frontingTypeReality}.json)
         fi
         local xhttpTLSConfig="/etc/v2ray-agent/xray/conf/14_VLESS_XHTTP_TLS_inbounds.json"
@@ -3207,8 +3207,8 @@ initXrayClients() {
     local users=
     users=[]
     while read -r user; do
-        uuid=$(echo "${user}" | jq -r .id//.uuid)
-        email=$(echo "${user}" | jq -r .email//.name | awk -F "[-]" '{print $1}')
+        uuid=$(echo "${user}" | jq -r '.id // .uuid // .password // empty')
+        email=$(echo "${user}" | jq -r '.email // .name // .username // empty' | awk -F "[-]" '{print $1}')
         currentUser=
         if echo "${type}" | grep -q "0"; then
             currentUser="{\"id\":\"${uuid}\",\"flow\":\"xtls-rprx-vision\",\"email\":\"${email}-VLESS_TCP/TLS_Vision\"}"
@@ -3515,7 +3515,7 @@ readPortHopping() {
         portHoppingStart=$(sudo firewall-cmd --list-forward-ports | grep "toport=${targetPort}" | head -1 | cut -d ":" -f 1 | cut -d "=" -f 2)
         portHoppingEnd=$(sudo firewall-cmd --list-forward-ports | grep "toport=${targetPort}" | tail -n 1 | cut -d ":" -f 1 | cut -d "=" -f 2)
     else
-        if iptables-save | grep -q "mack-a_${type}_portHopping"; then
+        if command -v iptables-save >/dev/null 2>&1 && iptables-save | grep -q "mack-a_${type}_portHopping"; then
             local portHopping=
             portHopping=$(iptables-save | grep "mack-a_${type}_portHopping" | cut -d " " -f 8)
 
@@ -9243,19 +9243,27 @@ customXrayInstall() {
             preserveSingBox=true
             configPath=/etc/v2ray-agent/xray/conf/
             mkdir -p "${configPath}"
+            handleSingBox stop
         fi
-        initXrayConfig custom 9 || return 1
+        if ! initXrayConfig custom 9; then
+            [[ "${preserveSingBox}" == true ]] && handleSingBox start
+            return 1
+        fi
         [[ "${preserveSingBox}" == true ]] || cleanUp singBoxDel
         if xraySelectionNeedsNginx "${selectCustomInstallType}"; then
             installCronTLS 10
         fi
 
         if echo "${selectCustomInstallType}" | grep -q ",14,"; then
-            restartXrayWithXHTTPTLSRollback || return 1
+            if ! restartXrayWithXHTTPTLSRollback; then
+                [[ "${preserveSingBox}" == true ]] && handleSingBox start
+                return 1
+            fi
         else
             handleXray stop
             handleXray start
         fi
+        [[ "${preserveSingBox}" == true ]] && handleSingBox start
         # 生成账号
         checkGFWStatue 11
         showAccounts 12
