@@ -209,6 +209,8 @@ initVar() {
     xhttpTLSDeploymentBackup=
     xhttpTLSDeploymentConfig=
     xhttpTLSDeploymentHadPrevious=
+    xhttpTLSEndpointDeploymentBackup=
+    xhttpTLSEndpointDeploymentHadPrevious=
     #    xrayVLESSRealityPublicKey=
 
     #    interfaceName=
@@ -339,6 +341,13 @@ initVar() {
     # 上次安装配置状态
     lastInstallationConfig=
 
+    # XHTTP TLS 部署/订阅端点（容器监听与公网端口可分离）
+    xhttpTLSEndpointConfigFile="/etc/v2ray-agent/xhttp_tls.json"
+    xhttpTLSEntryMode=
+    xhttpTLSAdvertiseAddress=
+    xhttpTLSAdvertisePort=
+    xhttpTLSALPN=
+
 }
 
 # Normalize Xray protocol selections while keeping Reality-only choices standalone.
@@ -378,11 +387,77 @@ xraySelectionNeedsCertificate() {
 }
 
 isValidXHTTPTLSPort() {
-    [[ "${1:-}" =~ ^[0-9]+$ ]] && ((10#${1} >= 10000 && 10#${1} <= 30000))
+    [[ "${1:-}" =~ ^[0-9]+$ ]] && ((10#${1} >= 1 && 10#${1} <= 65535))
+}
+
+getXHTTPTLSListenPort() {
+    local file=$1
+    jq -r '
+      ([.inbounds[]? | select(.tag == "dokodemo-in-VLESSXHTTPTLS") | .port][0]) //
+      ([.inbounds[]? | select(.tag == "VLESSXHTTPTLS" or .tag == "VLESSXHTTPTLS-H3") | .port][0]) // empty
+    ' "${file}" 2>/dev/null
+}
+
+getXHTTPTLSEntryMode() {
+    local file=$1
+    if jq -e '.inbounds[]? | select(.tag == "dokodemo-in-VLESSXHTTPTLS")' "${file}" >/dev/null 2>&1; then
+        printf 'tunnel\n'
+    else
+        printf 'direct\n'
+    fi
+}
+
+readXHTTPTLSEndpointSettings() {
+    local file=${xhttpTLSEndpointConfigFile:-/etc/v2ray-agent/xhttp_tls.json}
+    [[ -s "${file}" ]] || return 0
+    xhttpTLSEntryMode=$(jq -r '.entry_mode // empty' "${file}" 2>/dev/null)
+    xhttpTLSAdvertiseAddress=$(jq -r '.advertise_address // empty' "${file}" 2>/dev/null)
+    xhttpTLSAdvertisePort=$(jq -r '.advertise_port // empty' "${file}" 2>/dev/null)
+    xhttpTLSALPN=$(jq -r '.alpn // empty' "${file}" 2>/dev/null)
+}
+
+writeXHTTPTLSEndpointSettings() {
+    local file=${xhttpTLSEndpointConfigFile:-/etc/v2ray-agent/xhttp_tls.json}
+    local dir tmp
+    dir=$(dirname "${file}")
+    mkdir -p "${dir}" || return 1
+    tmp=$(mktemp "${dir}/.xhttp_tls.XXXXXX") || return 1
+    local endpoints='[]'
+    [[ -s "${file}" ]] && endpoints=$(jq -c '.endpoints // []' "${file}" 2>/dev/null || printf '[]')
+    if ! jq -n --arg mode "${xhttpTLSEntryMode}" \
+        --arg address "${xhttpTLSAdvertiseAddress}" \
+        --argjson listenPort "${xHTTPTLSPort}" \
+        --argjson advertisePort "${xhttpTLSAdvertisePort}" \
+        --arg alpn "${xhttpTLSALPN}" --argjson endpoints "${endpoints}" '
+          {version:1,entry_mode:$mode,listen_port:$listenPort,
+           advertise_address:$address,advertise_port:$advertisePort,alpn:$alpn,
+           endpoints:$endpoints}
+        ' >"${tmp}"; then
+        rm -f "${tmp}"
+        return 1
+    fi
+    mv -f "${tmp}" "${file}"
 }
 
 buildXrayXHTTPTLSConfig() {
-    local port=$1 domainName=$2 customPath=$3 clientsJson=$4
+    local port=$1 domainName=$2 customPath=$3 clientsJson=$4 entryMode=${5:-tunnel} alpnValue=${6:-h2}
+    if [[ "${entryMode}" == "direct" ]]; then
+        jq -n --arg domain "${domainName}" --arg path "/${customPath#\/}xHTTP" \
+            --argjson clients "${clientsJson}" --argjson listenPort "${port}" --arg alpn "${alpnValue}" '
+          def inbound($tag; $transportAlpn):
+            {listen:"0.0.0.0",port:$listenPort,protocol:"vless",tag:$tag,
+             settings:{clients:$clients,decryption:"none"},
+             streamSettings:{network:"xhttp",security:"tls",
+               tlsSettings:{serverName:$domain,minVersion:"1.2",rejectUnknownSni:true,
+                 alpn:[$transportAlpn],
+                 certificates:[{certificateFile:("/etc/v2ray-agent/tls/"+$domain+".crt"),keyFile:("/etc/v2ray-agent/tls/"+$domain+".key")}]},
+               xhttpSettings:{host:$domain,path:$path,mode:"auto"}}};
+          {inbounds:
+            (if $alpn == "h3" then [inbound("VLESSXHTTPTLS-H3"; "h3")]
+             elif $alpn == "h2,h3" then [inbound("VLESSXHTTPTLS"; "h2"), inbound("VLESSXHTTPTLS-H3"; "h3")]
+             else [inbound("VLESSXHTTPTLS"; "h2")] end)}'
+        return
+    fi
     jq -n --arg domain "${domainName}" --arg path "/${customPath#\/}xHTTP" \
         --argjson clients "${clientsJson}" --argjson publicPort "${port}" '
       {inbounds:[
@@ -398,14 +473,20 @@ buildXrayXHTTPTLSConfig() {
 }
 
 buildVLESSXHTTPTLSURI() {
-    local address=$1 port=$2 uuidValue=$3 domainName=$4 pathValue=$5 modeValue=$6 name=$7
+    local address=$1 port=$2 uuidValue=$3 domainName=$4 pathValue=$5 modeValue=$6 name=$7 alpnValue=${8:-h2} hostValue=${9:-$4} extraJSON=${10:-}
+    local extraParam=
+    if [[ -n "${extraJSON}" ]]; then
+        extraParam="&extra=$(printf '%s' "${extraJSON}" | jq -c . | jq -sRr @uri)"
+    fi
     pathValue="/${pathValue#\/}"
-    printf 'vless://%s@%s:%s?encryption=none&security=tls&type=xhttp&sni=%s&host=%s&fp=chrome&alpn=h2&path=%%2F%s&mode=%s#%s\n' \
-        "${uuidValue}" "${address}" "${port}" "${domainName}" "${domainName}" "${pathValue#/}" "${modeValue}" "${name}"
+    printf 'vless://%s@%s:%s?encryption=none&security=tls&type=xhttp&sni=%s&host=%s&fp=chrome&alpn=%s&path=%%2F%s&mode=%s%s#%s\n' \
+        "${uuidValue}" "${address}" "${port}" "${domainName}" "${hostValue}" "${alpnValue}" "${pathValue#/}" "${modeValue}" "${extraParam}" "${name}"
 }
 
 buildMihomoXHTTPTLSNode() {
-    local address=$1 port=$2 uuidValue=$3 domainName=$4 pathValue=$5 modeValue=$6 name=$7
+    local address=$1 port=$2 uuidValue=$3 domainName=$4 pathValue=$5 modeValue=$6 name=$7 alpnValue=${8:-h2} hostValue=${9:-$4} extraJSON=${10:-}
+    local yamlALPN
+    yamlALPN="[${alpnValue//,/, }]"
     pathValue="/${pathValue#\/}"
     cat <<EOF
   - name: "${name}"
@@ -418,13 +499,42 @@ buildMihomoXHTTPTLSNode() {
     network: xhttp
     packet-encoding: xudp
     client-fingerprint: chrome
-    alpn: [h2]
+    alpn: ${yamlALPN}
     servername: ${domainName}
     xhttp-opts:
       path: ${pathValue}
-      host: ${domainName}
+      host: ${hostValue}
       mode: ${modeValue}
+      reuse-settings:
+        max-connections: "3"
+        h-max-reusable-secs: "1800-3000"
+        h-keep-alive-period: 0
 EOF
+    if [[ -n "${extraJSON}" ]]; then
+        local dlAddress dlPort dlSNI dlHost dlPath dlALPN yamlDlALPN
+        dlAddress=$(jq -r '.downloadSettings.address // empty' <<<"${extraJSON}")
+        dlPort=$(jq -r '.downloadSettings.port // 443' <<<"${extraJSON}")
+        dlSNI=$(jq -r '.downloadSettings.tlsSettings.serverName // empty' <<<"${extraJSON}")
+        dlHost=$(jq -r '.downloadSettings.xhttpSettings.host // .downloadSettings.tlsSettings.serverName // empty' <<<"${extraJSON}")
+        dlPath=$(jq -r '.downloadSettings.xhttpSettings.path // empty' <<<"${extraJSON}")
+        dlALPN=$(jq -r '.downloadSettings.tlsSettings.alpn // ["h2"] | if type == "array" then join(",") else . end' <<<"${extraJSON}")
+        yamlDlALPN="[${dlALPN//,/, }]"
+        cat <<EOF
+      download-settings:
+        path: ${dlPath}
+        host: ${dlHost}
+        server: ${dlAddress}
+        port: ${dlPort}
+        tls: true
+        servername: ${dlSNI}
+        client-fingerprint: chrome
+        alpn: ${yamlDlALPN}
+        reuse-settings:
+          max-connections: "3"
+          h-max-reusable-secs: "1800-3000"
+          h-keep-alive-period: 0
+EOF
+    fi
 }
 
 uniqueCDNAddresses() {
@@ -443,10 +553,36 @@ uniqueCDNAddresses() {
 
 listXHTTPTLSEndpoints() {
     local originAddress=$1 originPort=$2 cdnCsv=${3:-}
-    printf '%s\t%s\tauto\n' "${originAddress}" "${originPort}"
+    local advertiseAddress=${xhttpTLSAdvertiseAddress:-${originAddress}}
+    local advertisePort=${xhttpTLSAdvertisePort:-${originPort}}
+    local alpn=${xhttpTLSALPN:-h2}
+    local defaultSNI=${xrayVLESSXHTTPTLSServerName:-${currentHost}}
+    printf '%s\t%s\tauto\t%s\t%s\t%s\t-\t-\n' "${advertiseAddress}" "${advertisePort}" "${alpn}" "${defaultSNI}" "${defaultSNI}"
     while IFS= read -r address; do
-        [[ -n "${address}" ]] && printf '%s\t443\tpacket-up\n' "${address}"
+        [[ -n "${address}" ]] && printf '%s\t443\tpacket-up\th2\t%s\t%s\t-\t-\n' "${address}" "${defaultSNI}" "${defaultSNI}"
     done < <(uniqueCDNAddresses "${cdnCsv}")
+    local file=${xhttpTLSEndpointConfigFile:-/etc/v2ray-agent/xhttp_tls.json}
+    if [[ -s "${file}" ]]; then
+        jq -r --arg sni "${defaultSNI}" '
+          .endpoints[]? | select(.enabled != false) | . as $endpoint |
+          [(.address // empty), ((.port // 443) | tostring), (.mode // "packet-up"),
+           (.alpn // "h2"), (.sni // $sni), (.host // .sni // $sni),
+           (($endpoint.download_settings // null) | if . == null then "-" else ({downloadSettings:.} | @base64) end),
+           (.name // "-")] | @tsv
+        ' "${file}" 2>/dev/null
+    fi
+    # 兼容旧分叉的上下行分离文件，避免升级后节点消失。
+    if [[ -s "/etc/v2ray-agent/xhttp_split" ]]; then
+        jq -r --arg sni "${defaultSNI}" --argjson defaultPort "${originPort}" --arg path "/${currentPath:-}xHTTP" '
+          .entries[]? | . as $entry |
+          {downloadSettings:{address:$entry.dl_address,port:($entry.dl_port // 443),network:"xhttp",security:"tls",
+            tlsSettings:{serverName:($entry.dl_sni // $sni),alpn:["h2"]},
+            xhttpSettings:{host:($entry.dl_sni // $sni),path:$path}}} as $extra |
+          [($entry.ul_address // empty), (($entry.ul_port // $defaultPort) | tostring), "stream-up",
+           ($entry.ul_alpn // "h2"), ($entry.ul_sni // $sni), ($entry.ul_sni // $sni),
+           ($extra | @base64), ($entry.suffix // "split")] | @tsv
+        ' /etc/v2ray-agent/xhttp_split 2>/dev/null
+    fi
 }
 
 buildXHTTPTLSNodeName() {
@@ -486,6 +622,7 @@ getXrayAccountReferenceConfig() {
         "${configPath}${frontingType:-}.json" \
         "${configPath}${frontingTypeReality:-}.json" \
         "${configPath}14_VLESS_XHTTP_TLS_inbounds.json" \
+        "/etc/v2ray-agent/xray/conf/14_VLESS_XHTTP_TLS_inbounds.json" \
         "${configPath}12_VLESS_XHTTP_inbounds.json"; do
         if [[ -f "${candidate}" ]] && jq -e '(.inbounds[0].settings.clients // .inbounds[1].settings.clients) | type == "array"' "${candidate}" >/dev/null 2>&1; then
             printf '%s\n' "${candidate}"
@@ -500,7 +637,7 @@ beginAccountTransaction() {
     accountTransactionManifest="${accountTransactionDir}/manifest"
     : >"${accountTransactionManifest}" || return 1
     local directory file backupName count=0 seenDirectories=$'\n'
-    for directory in "${configPath:-}" "${singBoxConfigPath:-}"; do
+    for directory in "${configPath:-}" "${singBoxConfigPath:-}" "/etc/v2ray-agent/xray/conf/"; do
         [[ -z "${directory}" || "${seenDirectories}" == *$'\n'"${directory}"$'\n'* ]] && continue
         seenDirectories="${seenDirectories}${directory}"$'\n'
         for file in "${directory}"*_inbounds.json; do
@@ -562,9 +699,17 @@ rollbackXrayXHTTPTLSDeployment() {
             [[ -n "${xhttpTLSDeploymentBackup:-}" ]] && rm -f "${xhttpTLSDeploymentBackup}"
         fi
     fi
+    if [[ "${xhttpTLSEndpointDeploymentHadPrevious:-}" == true && -f "${xhttpTLSEndpointDeploymentBackup:-}" ]]; then
+        mv -f "${xhttpTLSEndpointDeploymentBackup}" "${xhttpTLSEndpointConfigFile:-/etc/v2ray-agent/xhttp_tls.json}"
+    elif [[ -n "${xhttpTLSEndpointDeploymentBackup:-}" || "${xhttpTLSEndpointDeploymentHadPrevious:-}" == false ]]; then
+        rm -f "${xhttpTLSEndpointConfigFile:-/etc/v2ray-agent/xhttp_tls.json}"
+        [[ -n "${xhttpTLSEndpointDeploymentBackup:-}" ]] && rm -f "${xhttpTLSEndpointDeploymentBackup}"
+    fi
     xhttpTLSDeploymentBackup=
     xhttpTLSDeploymentConfig=
     xhttpTLSDeploymentHadPrevious=
+    xhttpTLSEndpointDeploymentBackup=
+    xhttpTLSEndpointDeploymentHadPrevious=
 }
 
 restartXrayWithXHTTPTLSRollback() {
@@ -576,9 +721,12 @@ restartXrayWithXHTTPTLSRollback() {
         return 1
     fi
     [[ -n "${xhttpTLSDeploymentBackup:-}" ]] && rm -f "${xhttpTLSDeploymentBackup}"
+    [[ -n "${xhttpTLSEndpointDeploymentBackup:-}" ]] && rm -f "${xhttpTLSEndpointDeploymentBackup}"
     xhttpTLSDeploymentBackup=
     xhttpTLSDeploymentConfig=
     xhttpTLSDeploymentHadPrevious=
+    xhttpTLSEndpointDeploymentBackup=
+    xhttpTLSEndpointDeploymentHadPrevious=
 }
 
 # 读取tls证书详情
@@ -639,22 +787,27 @@ readInstallType() {
     # 1.检测安装目录
     if [[ -d "/etc/v2ray-agent" ]]; then
         if [[ -f "/etc/v2ray-agent/xray/xray" ]]; then
-            # 检测xray-core
-        if [[ -d "/etc/v2ray-agent/xray/conf" ]] && [[ -f "/etc/v2ray-agent/xray/conf/02_VLESS_TCP_inbounds.json" || -f "/etc/v2ray-agent/xray/conf/02_trojan_TCP_inbounds.json" || -f "/etc/v2ray-agent/xray/conf/07_VLESS_vision_reality_inbounds.json" || -f "/etc/v2ray-agent/xray/conf/12_VLESS_XHTTP_inbounds.json" || -f "/etc/v2ray-agent/xray/conf/14_VLESS_XHTTP_TLS_inbounds.json" ]]; then
-                # xray-core
+            # Xray 只承载 XHTTP TLS 时，不抢占已安装 sing-box 的主核心身份。
+            local xrayConfDir="/etc/v2ray-agent/xray/conf"
+            local singBoxMain=false
+            if [[ -f "${xrayConfDir}/14_VLESS_XHTTP_TLS_inbounds.json" ]] && \
+                [[ -z "$(find "${xrayConfDir}" -maxdepth 1 -type f -name '*_inbounds.json' ! -name '14_VLESS_XHTTP_TLS_inbounds.json' -print -quit 2>/dev/null)" ]] && \
+                [[ -f "/etc/v2ray-agent/sing-box/sing-box" && -f "/etc/v2ray-agent/sing-box/conf/config.json" ]]; then
+                singBoxMain=true
+            fi
+            if [[ "${singBoxMain}" == true ]]; then
+                ctlPath=/etc/v2ray-agent/sing-box/sing-box
+                coreInstallType=2
+                configPath=/etc/v2ray-agent/sing-box/conf/config/
+                singBoxConfigPath=/etc/v2ray-agent/sing-box/conf/config/
+            elif [[ -d "${xrayConfDir}" ]] && [[ -f "${xrayConfDir}/02_VLESS_TCP_inbounds.json" || -f "${xrayConfDir}/02_trojan_TCP_inbounds.json" || -f "${xrayConfDir}/07_VLESS_vision_reality_inbounds.json" || -f "${xrayConfDir}/12_VLESS_XHTTP_inbounds.json" || -f "${xrayConfDir}/14_VLESS_XHTTP_TLS_inbounds.json" ]]; then
                 configPath=/etc/v2ray-agent/xray/conf/
                 ctlPath=/etc/v2ray-agent/xray/xray
                 coreInstallType=1
 
-                if [[ -f "${configPath}07_VLESS_vision_reality_inbounds.json" ]]; then
-                    realityStatus=7
-                fi
-                if [[ -f "${configPath}12_VLESS_XHTTP_inbounds.json" ]]; then
-                    realityStatus=12
-                fi
-                if [[ -f "${configPath}14_VLESS_XHTTP_TLS_inbounds.json" ]]; then
-                    realityStatus=14
-                fi
+                [[ -f "${configPath}07_VLESS_vision_reality_inbounds.json" ]] && realityStatus=7
+                [[ -f "${configPath}12_VLESS_XHTTP_inbounds.json" ]] && realityStatus=12
+                [[ -f "${configPath}14_VLESS_XHTTP_TLS_inbounds.json" ]] && realityStatus=14
                 if [[ -f "/etc/v2ray-agent/sing-box/sing-box" ]] && [[ -f "/etc/v2ray-agent/sing-box/conf/config/06_hysteria2_inbounds.json" || -f "/etc/v2ray-agent/sing-box/conf/config/09_tuic_inbounds.json" || -f "/etc/v2ray-agent/sing-box/conf/config/20_socks5_inbounds.json" ]]; then
                     singBoxConfigPath=/etc/v2ray-agent/sing-box/conf/config/
                 fi
@@ -706,6 +859,8 @@ readInstallProtocolType() {
     singBoxVMessWSPort=
     singBoxSocks5Port=
 
+    readXHTTPTLSEndpointSettings
+
     while read -r row; do
         if echo "${row}" | grep -q VLESS_TCP_inbounds; then
             currentInstallProtocolType="${currentInstallProtocolType}0,"
@@ -740,7 +895,8 @@ readInstallProtocolType() {
 
         if echo "${row}" | grep -q 14_VLESS_XHTTP_TLS_inbounds; then
             currentInstallProtocolType="${currentInstallProtocolType}14,"
-            xrayVLESSXHTTPTLSPort=$(jq -r '.inbounds[1].port' "${row}.json")
+            xrayVLESSXHTTPTLSPort=$(getXHTTPTLSListenPort "${row}.json")
+            [[ -z "${xhttpTLSEntryMode}" ]] && xhttpTLSEntryMode=$(getXHTTPTLSEntryMode "${row}.json")
             xrayVLESSXHTTPTLSServerName=$(jq -r '.inbounds[0].streamSettings.tlsSettings.serverName' "${row}.json")
             [[ -z "${xrayVLESSXHTTPTLSServerName}" || "${xrayVLESSXHTTPTLSServerName}" == null ]] && xrayVLESSXHTTPTLSServerName=$(jq -r '.inbounds[0].streamSettings.xhttpSettings.host' "${row}.json")
         fi
@@ -859,6 +1015,14 @@ readInstallProtocolType() {
             currentInstallProtocolType="${currentInstallProtocolType}9,"
             singBoxTuicPort=$(jq .inbounds[0].listen_port "${singBoxConfigPath}09_tuic_inbounds.json")
         fi
+    fi
+    # sing-box 为主核心时，仍识别独立运行的 Xray XHTTP TLS。
+    if [[ "${coreInstallType}" == "2" && -f "/etc/v2ray-agent/xray/conf/14_VLESS_XHTTP_TLS_inbounds.json" ]]; then
+        local xhttpTLSStandaloneConfig="/etc/v2ray-agent/xray/conf/14_VLESS_XHTTP_TLS_inbounds.json"
+        currentInstallProtocolType="${currentInstallProtocolType}14,"
+        xrayVLESSXHTTPTLSPort=$(getXHTTPTLSListenPort "${xhttpTLSStandaloneConfig}")
+        [[ -z "${xhttpTLSEntryMode}" ]] && xhttpTLSEntryMode=$(getXHTTPTLSEntryMode "${xhttpTLSStandaloneConfig}")
+        xrayVLESSXHTTPTLSServerName=$(jq -r '.inbounds[0].streamSettings.tlsSettings.serverName // .inbounds[0].streamSettings.xhttpSettings.host // empty' "${xhttpTLSStandaloneConfig}")
     fi
     if [[ "${currentInstallProtocolType:0:1}" != "," ]]; then
         currentInstallProtocolType=",${currentInstallProtocolType}"
@@ -1144,12 +1308,13 @@ readConfigHostPathUUID() {
             fi
             currentPath=$(jq -r .inbounds[0].streamSettings.xhttpSettings.path ${configPath}12_VLESS_XHTTP_inbounds.json | awk -F "[/]" '{print $2}' | awk -F "[x][H][T][T][P]" '{print $1}')
         fi
-        if echo ${currentInstallProtocolType} | grep -q ",14," && [[ -f "${configPath}14_VLESS_XHTTP_TLS_inbounds.json" ]]; then
-            local xhttpTLSConfig="${configPath}14_VLESS_XHTTP_TLS_inbounds.json"
+        local xhttpTLSConfig="${configPath}14_VLESS_XHTTP_TLS_inbounds.json"
+        [[ -f "${xhttpTLSConfig}" ]] || xhttpTLSConfig="/etc/v2ray-agent/xray/conf/14_VLESS_XHTTP_TLS_inbounds.json"
+        if echo ${currentInstallProtocolType} | grep -q ",14," && [[ -f "${xhttpTLSConfig}" ]]; then
             currentClients=$(jq -c '.inbounds[0].settings.clients' "${xhttpTLSConfig}")
             currentUUID=$(jq -r '.inbounds[0].settings.clients[0].id // empty' "${xhttpTLSConfig}")
             currentHost=$(jq -r '.inbounds[0].streamSettings.tlsSettings.serverName // .inbounds[0].streamSettings.xhttpSettings.host // empty' "${xhttpTLSConfig}")
-            currentPort=$(jq -r '.inbounds[1].port' "${xhttpTLSConfig}")
+            currentPort=$(getXHTTPTLSListenPort "${xhttpTLSConfig}")
             xrayVLESSXHTTPTLSPort=${currentPort}
             currentPath=$(jq -r '.inbounds[0].streamSettings.xhttpSettings.path' "${xhttpTLSConfig}" | sed -E 's#^/##; s#xHTTP$##')
         fi
@@ -1165,6 +1330,12 @@ readConfigHostPathUUID() {
         else
             currentUUID=$(jq -r .inbounds[0].users[0].uuid ${configPath}${frontingTypeReality}.json)
             currentClients=$(jq -r .inbounds[0].users ${configPath}${frontingTypeReality}.json)
+        fi
+        local xhttpTLSConfig="/etc/v2ray-agent/xray/conf/14_VLESS_XHTTP_TLS_inbounds.json"
+        if echo ${currentInstallProtocolType} | grep -q ",14," && [[ -f "${xhttpTLSConfig}" ]]; then
+            currentHost=$(jq -r '.inbounds[0].streamSettings.tlsSettings.serverName // .inbounds[0].streamSettings.xhttpSettings.host // empty' "${xhttpTLSConfig}")
+            currentPath=$(jq -r '.inbounds[0].streamSettings.xhttpSettings.path' "${xhttpTLSConfig}" | sed -E 's#^/##; s#xHTTP$##')
+            xrayVLESSXHTTPTLSPort=$(getXHTTPTLSListenPort "${xhttpTLSConfig}")
         fi
     fi
 
@@ -1310,15 +1481,17 @@ cleanUp() {
         rm -rf /etc/v2ray-agent/sing-box/conf/config/* >/dev/null 2>&1
     fi
 }
-initVar "$1"
-checkSystem
-checkCPUVendor
+if [[ "${V2RAY_AGENT_LIB_ONLY:-false}" != true ]]; then
+    initVar "${1:-}"
+    checkSystem
+    checkCPUVendor
 
-readInstallType
-readInstallProtocolType
-readConfigHostPathUUID
-readCustomPort
-readSingBoxConfig
+    readInstallType
+    readInstallProtocolType
+    readConfigHostPathUUID
+    readCustomPort
+    readSingBoxConfig
+fi
 # -------------------------------------------------------------
 
 # 初始化安装目录
@@ -4343,7 +4516,7 @@ EOF
     # VLESS XHTTP TLS tunnel (Xray-only, no Nginx path fronting)
     if echo "${selectCustomInstallType}" | grep -q ",14," || [[ "$1" == "all" ]]; then
         initXrayXHTTPTLSPort || return 1
-        if ! checkPort 45988 transaction; then
+        if [[ "${xhttpTLSEntryMode}" == "tunnel" ]] && ! checkPort 45988 transaction; then
             echoContent red " ---> XHTTP TLS本地端口45988被占用"
             return 1
         fi
@@ -4356,7 +4529,7 @@ EOF
         local xhttpTLSTmp xhttpTLSClients
         xhttpTLSTmp=$(mktemp "${xhttpTLSConfigDir}.14_VLESS_XHTTP_TLS.XXXXXX") || return 1
         xhttpTLSClients=$(initXrayClients 14) || { rm -f "${xhttpTLSTmp}"; return 1; }
-        if ! buildXrayXHTTPTLSConfig "${xHTTPTLSPort}" "${domain}" "${customPath}" "${xhttpTLSClients}" | jq . >"${xhttpTLSTmp}"; then
+        if ! buildXrayXHTTPTLSConfig "${xHTTPTLSPort}" "${domain}" "${customPath}" "${xhttpTLSClients}" "${xhttpTLSEntryMode}" "${xhttpTLSALPN}" | jq . >"${xhttpTLSTmp}"; then
             rm -f "${xhttpTLSTmp}"
             return 1
         fi
@@ -4376,6 +4549,23 @@ EOF
         xhttpTLSDeploymentBackup=${xhttpTLSBackup}
         xhttpTLSDeploymentConfig=${xhttpTLSConfigFile}
         xhttpTLSDeploymentHadPrevious=${xhttpTLSHadPrevious}
+        xhttpTLSEndpointDeploymentHadPrevious=false
+        if [[ -f "${xhttpTLSEndpointConfigFile}" ]]; then
+            xhttpTLSEndpointDeploymentBackup=$(mktemp "$(dirname "${xhttpTLSEndpointConfigFile}")/.xhttp_tls.backup.XXXXXX") || {
+                rollbackXrayXHTTPTLSDeployment
+                return 1
+            }
+            cp -f "${xhttpTLSEndpointConfigFile}" "${xhttpTLSEndpointDeploymentBackup}" || {
+                rollbackXrayXHTTPTLSDeployment
+                return 1
+            }
+            xhttpTLSEndpointDeploymentHadPrevious=true
+        fi
+        if ! writeXHTTPTLSEndpointSettings; then
+            rollbackXrayXHTTPTLSDeployment
+            echoContent red " ---> XHTTP TLS端点配置写入失败"
+            return 1
+        fi
     elif [[ -z "$3" ]]; then
         rm /etc/v2ray-agent/xray/conf/14_VLESS_XHTTP_TLS_inbounds.json >/dev/null 2>&1
     fi
@@ -5113,16 +5303,20 @@ defaultBase64Code() {
     local user=
     user=$(echo "${email}" | awk -F "[-]" '{print $1}')
     if [[ "${type}" == "vlessXHTTPTLS" ]]; then
-        local xhttpTLSURI
-        xhttpTLSURI=$(buildVLESSXHTTPTLSURI "${add}" "${port}" "${id}" "${currentHost}" "${path}" "${currentXHTTPMode:-auto}" "${email}")
+        local xhttpTLSURI xhttpTLSNodeALPN xhttpTLSNodeSNI xhttpTLSNodeHost xhttpTLSExtraJSON
+        xhttpTLSNodeALPN=${currentXHTTPALPN:-h2}
+        xhttpTLSNodeSNI=${currentXHTTPSNI:-${currentHost}}
+        xhttpTLSNodeHost=${currentXHTTPHost:-${xhttpTLSNodeSNI}}
+        xhttpTLSExtraJSON=${currentXHTTPExtraJSON:-}
+        xhttpTLSURI=$(buildVLESSXHTTPTLSURI "${add}" "${port}" "${id}" "${xhttpTLSNodeSNI}" "${path}" "${currentXHTTPMode:-auto}" "${email}" "${xhttpTLSNodeALPN}" "${xhttpTLSNodeHost}" "${xhttpTLSExtraJSON}")
         echoContent yellow " ---> 通用格式(VLESS+XHTTP+TLS)"
         echoContent green "    ${xhttpTLSURI}"
         echoContent yellow " ---> 格式化明文(VLESS+XHTTP+TLS)"
-        echoContent green "协议类型:VLESS，地址:${add}，伪装域名/SNI:${currentHost}，端口:${port}，用户ID:${id}，安全:tls，传输方式:xhttp，路径:${path}，模式:${currentXHTTPMode:-auto}，账户名:${email}\n"
+        echoContent green "协议类型:VLESS，地址:${add}，SNI:${xhttpTLSNodeSNI}，Host:${xhttpTLSNodeHost}，端口:${port}，用户ID:${id}，安全:tls，传输方式:xhttp，路径:${path}，模式:${currentXHTTPMode:-auto}，ALPN:${xhttpTLSNodeALPN}，账户名:${email}\n"
         echoContent yellow " ---> 二维码 VLESS(VLESS+XHTTP+TLS)"
-        echoContent green "    https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=vless%3A%2F%2F${id}%40${add}%3A${port}%3Fencryption%3Dnone%26security%3Dtls%26type%3Dxhttp%26sni%3D${currentHost}%26host%3D${currentHost}%26fp%3Dchrome%26alpn%3Dh2%26path%3D%252F${path#/}%26mode%3D${currentXHTTPMode:-auto}%23${email}"
+        echoContent green "    https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=$(printf '%s' "${xhttpTLSURI}" | jq -sRr @uri)"
         printf '%s\n' "${xhttpTLSURI}" >>"/etc/v2ray-agent/subscribe_local/default/${user}"
-        buildMihomoXHTTPTLSNode "${add}" "${port}" "${id}" "${currentHost}" "${path}" "${currentXHTTPMode:-auto}" "${email}" >>"/etc/v2ray-agent/subscribe_local/clashMeta/${user}"
+        buildMihomoXHTTPTLSNode "${add}" "${port}" "${id}" "${xhttpTLSNodeSNI}" "${path}" "${currentXHTTPMode:-auto}" "${email}" "${xhttpTLSNodeALPN}" "${xhttpTLSNodeHost}" "${xhttpTLSExtraJSON}" >>"/etc/v2ray-agent/subscribe_local/clashMeta/${user}"
         return 0
     fi
     if [[ ! -f "/etc/v2ray-agent/subscribe_local/sing-box/${user}" ]]; then
@@ -5873,28 +6067,39 @@ showAccounts() {
         done
     fi
     # VLESS XHTTP TLS tunnel (Xray-only subscriptions)
-    if echo ${currentInstallProtocolType} | grep -q ",14," && [[ -f "${configPath}14_VLESS_XHTTP_TLS_inbounds.json" ]]; then
+    local xhttpTLSAccountConfig="${configPath}14_VLESS_XHTTP_TLS_inbounds.json"
+    [[ -f "${xhttpTLSAccountConfig}" ]] || xhttpTLSAccountConfig="/etc/v2ray-agent/xray/conf/14_VLESS_XHTTP_TLS_inbounds.json"
+    if echo ${currentInstallProtocolType} | grep -q ",14," && [[ -f "${xhttpTLSAccountConfig}" ]]; then
         echoContent skyBlue "\n================================ VLESS XHTTP TLS [随机端口] ================================\n"
         local xhttpTLSCDNAddress=
         if [[ -f "/etc/v2ray-agent/cdn" ]]; then
             xhttpTLSCDNAddress=$(head -1 "/etc/v2ray-agent/cdn" | tr -d '\r\n')
         fi
         local xhttpTLSUsedNames=$'\n'
+        local xhttpTLSPreviousHost=${currentHost}
+        [[ -n "${xrayVLESSXHTTPTLSServerName}" ]] && currentHost=${xrayVLESSXHTTPTLSServerName}
         while read -r user; do
             local email uuidValue
             email=$(echo "${user}" | jq -r '.email // .name')
             uuidValue=$(echo "${user}" | jq -r '.id // .uuid // .password')
             local endpointIndex=0 nodeName
-            while IFS=$'\t' read -r endpointAddress endpointPort endpointMode; do
+            while IFS=$'\t' read -r endpointAddress endpointPort endpointMode endpointALPN endpointSNI endpointHost endpointExtra endpointLabel; do
                 [[ -z "${endpointAddress}" ]] && continue
                 nodeName=$(buildXHTTPTLSNodeName "${email}" "${endpointIndex}" "${xhttpTLSUsedNames}")
                 xhttpTLSUsedNames="${xhttpTLSUsedNames}${nodeName}"$'\n'
                 echoContent skyBlue "\n ---> 账号:${nodeName}"
                 currentXHTTPMode=${endpointMode}
+                currentXHTTPALPN=${endpointALPN:-h2}
+                currentXHTTPSNI=${endpointSNI:-${currentHost}}
+                currentXHTTPHost=${endpointHost:-${currentXHTTPSNI}}
+                currentXHTTPExtraJSON=
+                [[ -n "${endpointExtra}" && "${endpointExtra}" != "-" ]] && currentXHTTPExtraJSON=$(printf '%s' "${endpointExtra}" | base64 -d 2>/dev/null)
+                [[ -n "${endpointLabel}" && "${endpointLabel}" != "-" ]] && nodeName="${email}_${endpointLabel}"
                 defaultBase64Code vlessXHTTPTLS "${endpointPort}" "${nodeName}" "${uuidValue}" "${endpointAddress}" "${currentPath}xHTTP"
                 endpointIndex=$((endpointIndex + 1))
             done < <(listXHTTPTLSEndpoints "$(getPublicIP)" "${xrayVLESSXHTTPTLSPort}" "${xhttpTLSCDNAddress}")
-        done < <(jq -c '.inbounds[0].settings.clients[]?' "${configPath}14_VLESS_XHTTP_TLS_inbounds.json")
+        done < <(jq -c '.inbounds[0].settings.clients[]?' "${xhttpTLSAccountConfig}")
+        currentHost=${xhttpTLSPreviousHost}
     fi
     # AnyTLS
     if echo ${currentInstallProtocolType} | grep -q ",13,"; then
@@ -6412,11 +6617,13 @@ addUser() {
         fi
 
         # VLESS XHTTP TLS tunnel
-        if echo "${currentInstallProtocolType}" | grep -q ",14," && [[ -f "${configPath}14_VLESS_XHTTP_TLS_inbounds.json" ]]; then
+        local xhttpTLSUserConfig="${configPath}14_VLESS_XHTTP_TLS_inbounds.json"
+        [[ -f "${xhttpTLSUserConfig}" ]] || xhttpTLSUserConfig="/etc/v2ray-agent/xray/conf/14_VLESS_XHTTP_TLS_inbounds.json"
+        if echo "${currentInstallProtocolType}" | grep -q ",14," && [[ -f "${xhttpTLSUserConfig}" ]]; then
             local clients xhttpTLSResult
             clients=$(initXrayClients 14 "${uuid}" "${email}")
-            xhttpTLSResult=$(jq --argjson clients "${clients}" '.inbounds[0].settings.clients = $clients' "${configPath}14_VLESS_XHTTP_TLS_inbounds.json")
-            echo "${xhttpTLSResult}" | jq . >"${configPath}14_VLESS_XHTTP_TLS_inbounds.json"
+            xhttpTLSResult=$(jq --argjson clients "${clients}" '(.inbounds[] | select(.protocol == "vless" and .streamSettings.network == "xhttp") | .settings.clients) = $clients' "${xhttpTLSUserConfig}")
+            echo "${xhttpTLSResult}" | jq . >"${xhttpTLSUserConfig}"
         fi
         # VLESS Reality XHTTP
         if echo "${currentInstallProtocolType}" | grep -q ",12," && [[ -f "${configPath}12_VLESS_XHTTP_inbounds.json" ]]; then
@@ -6589,13 +6796,15 @@ removeUser() {
             }
         fi
     elif [[ "${coreInstallType}" == "2" ]]; then
-        jq -r -c .inbounds[0].users[].name//.inbounds[0].users[].username ${configPath}${frontingType:-$frontingTypeReality}.json | awk '{print NR""":"$0}'
+        local singBoxReferenceConfig="${configPath}${frontingType:-$frontingTypeReality}.json"
+        jq -r -c .inbounds[0].users[].name//.inbounds[0].users[].username "${singBoxReferenceConfig}" | awk '{print NR""":"$0}'
         read -r -p "请选择要删除的用户编号[仅支持单个删除]:" delUserIndex
-        if [[ $(jq -r '.inbounds[0].users|length' ${configPath}${frontingType:-$frontingTypeReality}.json) -lt ${delUserIndex} ]]; then
+        if [[ ! "${delUserIndex}" =~ ^[0-9]+$ ]] || [[ "${delUserIndex}" -lt 1 ]] || [[ $(jq -r '.inbounds[0].users|length' "${singBoxReferenceConfig}") -lt ${delUserIndex} ]]; then
             echoContent red " ---> 选择错误"
             return 1
         else
             delUserIndex=$((delUserIndex - 1))
+            uuid=$(jq -r --argjson index "${delUserIndex}" '.inbounds[0].users[$index].uuid // .inbounds[0].users[$index].password // empty' "${singBoxReferenceConfig}")
         fi
     fi
 
@@ -6615,6 +6824,12 @@ removeUser() {
                     return 1
                 fi
             done
+        elif [[ -n "${uuid}" && -f "/etc/v2ray-agent/xray/conf/14_VLESS_XHTTP_TLS_inbounds.json" ]]; then
+            if ! removeXrayClientByUUID "/etc/v2ray-agent/xray/conf/14_VLESS_XHTTP_TLS_inbounds.json" "${uuid}"; then
+                echoContent red " ---> XHTTP TLS用户删除失败，已回滚"
+                rollbackAccountTransaction
+                return 1
+            fi
         fi
 
         if [[ "${coreInstallType}" != "1" ]] && echo ${currentInstallProtocolType} | grep -q ",0,"; then
@@ -9023,8 +9238,14 @@ customXrayInstall() {
         # 安装Xray
         installXray 7 false
         installXrayService 8
-        initXrayConfig custom 9
-        cleanUp singBoxDel
+        local preserveSingBox=false
+        if [[ "${selectCustomInstallType}" == ",14," && -f "/etc/v2ray-agent/sing-box/sing-box" && -f "/etc/v2ray-agent/sing-box/conf/config.json" ]]; then
+            preserveSingBox=true
+            configPath=/etc/v2ray-agent/xray/conf/
+            mkdir -p "${configPath}"
+        fi
+        initXrayConfig custom 9 || return 1
+        [[ "${preserveSingBox}" == true ]] || cleanUp singBoxDel
         if xraySelectionNeedsNginx "${selectCustomInstallType}"; then
             installCronTLS 10
         fi
@@ -10262,9 +10483,10 @@ initXrayXHTTPort() {
     fi
 }
 
-# 初始化 XHTTP TLS 公网 TCP 端口
+# 初始化 XHTTP TLS 监听与对外映射
 initXrayXHTTPTLSPort() {
     xHTTPTLSPort=
+    readXHTTPTLSEndpointSettings
     if [[ -n "${xrayVLESSXHTTPTLSPort}" && -z "${lastInstallationConfig}" ]]; then
         read -r -p "读取到上次安装记录，是否使用上次安装时的端口？[y/n]:" historyXHTTPTLSPortStatus
         [[ "${historyXHTTPTLSPortStatus}" == "y" ]] && xHTTPTLSPort=${xrayVLESSXHTTPTLSPort}
@@ -10272,7 +10494,7 @@ initXrayXHTTPTLSPort() {
         xHTTPTLSPort=${xrayVLESSXHTTPTLSPort}
     fi
     if [[ -z "${xHTTPTLSPort}" ]]; then
-        read -r -p "请输入XHTTP TLS公网TCP端口[回车随机10000-30000]:" xHTTPTLSPort
+        read -r -p "请输入XHTTP TLS容器/本机监听端口[回车随机10000-30000]:" xHTTPTLSPort
     fi
     if [[ -z "${xHTTPTLSPort}" ]]; then
         local attempts=0
@@ -10296,8 +10518,51 @@ initXrayXHTTPTLSPort() {
         return 1
     fi
     checkPort "${xHTTPTLSPort}" transaction || return 1
+
+    local defaultEntryMode=${xhttpTLSEntryMode:-tunnel}
+    echoContent yellow "XHTTP TLS入口模式: 1.direct[容器/NAT/H3] 2.tunnel[上游双inbound]"
+    local entryModeSelection
+    read -r -p "请选择[默认:${defaultEntryMode}]:" entryModeSelection
+    if [[ "${entryModeSelection}" == "1" ]]; then
+        xhttpTLSEntryMode=direct
+    elif [[ "${entryModeSelection}" == "2" ]]; then
+        xhttpTLSEntryMode=tunnel
+    else
+        xhttpTLSEntryMode=${defaultEntryMode}
+    fi
+
+    local defaultAdvertiseAddress=${xhttpTLSAdvertiseAddress:-${domain:-}}
+    [[ -z "${defaultAdvertiseAddress}" ]] && defaultAdvertiseAddress=$(getPublicIP)
+    local advertiseAddressInput=
+    read -r -p "请输入订阅对外地址[默认:${defaultAdvertiseAddress}]:" advertiseAddressInput
+    xhttpTLSAdvertiseAddress=${advertiseAddressInput:-${defaultAdvertiseAddress}}
+
+    local defaultAdvertisePort=${xhttpTLSAdvertisePort:-${xHTTPTLSPort}}
+    local advertisePortInput=
+    read -r -p "请输入公网映射端口[默认:${defaultAdvertisePort}]:" advertisePortInput
+    xhttpTLSAdvertisePort=${advertisePortInput:-${defaultAdvertisePort}}
+    if ! isValidXHTTPTLSPort "${xhttpTLSAdvertisePort}"; then
+        echoContent red " ---> XHTTP TLS公网映射端口输入错误"
+        return 1
+    fi
+
+    if [[ "${xhttpTLSEntryMode}" == "tunnel" ]]; then
+        xhttpTLSALPN=h2
+    else
+        local defaultALPN=${xhttpTLSALPN:-h2,h3}
+        local alpnInput=
+        read -r -p "请输入直连ALPN[h2/h3/h2,h3，默认:${defaultALPN}]:" alpnInput
+        xhttpTLSALPN=${alpnInput:-${defaultALPN}}
+        if [[ "${xhttpTLSALPN}" != "h2" && "${xhttpTLSALPN}" != "h3" && "${xhttpTLSALPN}" != "h2,h3" ]]; then
+            echoContent red " ---> ALPN输入错误"
+            return 1
+        fi
+    fi
+
     allowPort "${xHTTPTLSPort}"
-    echoContent yellow "\n ---> XHTTP TLS端口: ${xHTTPTLSPort}"
+    [[ "${xhttpTLSEntryMode}" == "direct" && "${xhttpTLSALPN}" == *h3* ]] && allowPort "${xHTTPTLSPort}" "udp"
+    echoContent yellow "\n ---> XHTTP TLS监听: ${xHTTPTLSPort} (${xhttpTLSEntryMode})"
+    echoContent yellow " ---> 订阅对外端点: ${xhttpTLSAdvertiseAddress}:${xhttpTLSAdvertisePort} (ALPN: ${xhttpTLSALPN})"
 }
 
 # reality管理
@@ -10497,6 +10762,115 @@ singBoxVersionManageMenu() {
     fi
 }
 
+# XHTTP TLS 自定义端点管理
+showXHTTPTLSEndpoints() {
+    local file=${xhttpTLSEndpointConfigFile:-/etc/v2ray-agent/xhttp_tls.json}
+    if [[ ! -s "${file}" ]]; then
+        echoContent yellow " ---> 尚未生成 XHTTP TLS 部署配置"
+        return 1
+    fi
+    echoContent skyBlue "\n===== XHTTP TLS 部署 ====="
+    jq -r '"  入口模式: \(.entry_mode)\n  本机监听: \(.listen_port)\n  对外端点: \(.advertise_address):\(.advertise_port)\n  ALPN: \(.alpn)"' "${file}"
+    echoContent skyBlue "\n===== 自定义 CDN/分离端点 ====="
+    if [[ "$(jq '.endpoints // [] | length' "${file}" 2>/dev/null)" == "0" ]]; then
+        echoContent yellow "  暂无"
+        return 0
+    fi
+    jq -r '(.endpoints // []) | to_entries[] |
+      "  \(.key + 1). [\(.value.name // "endpoint")] \(.value.address):\(.value.port // 443)" +
+      " mode=\(.value.mode // "packet-up") alpn=\(.value.alpn // "h2")" +
+      " sni=\(.value.sni // "默认")" +
+      (if .value.download_settings then "\n     下行: \(.value.download_settings.address):\(.value.download_settings.port // 443)" else "" end)
+    ' "${file}"
+}
+
+addXHTTPTLSEndpoint() {
+    local file=${xhttpTLSEndpointConfigFile:-/etc/v2ray-agent/xhttp_tls.json}
+    [[ -s "${file}" ]] || { echoContent red " ---> 请先安装 VLESS+XHTTP+TLS"; return 1; }
+    local name address port modeSelection mode alpn sni host
+    read -r -p "端点名称[如:cdn-hk]:" name
+    read -r -p "上行地址[IP/域名]:" address
+    [[ -n "${name}" && -n "${address}" ]] || { echoContent red " ---> 名称和地址不能为空"; return 1; }
+    read -r -p "上行端口[默认:443]:" port
+    port=${port:-443}
+    isValidXHTTPTLSPort "${port}" || { echoContent red " ---> 端口输入错误"; return 1; }
+    echoContent yellow "上行模式: 1.packet-up[默认/CDN] 2.stream-up[上下行分离] 3.auto[直连]"
+    read -r -p "请选择:" modeSelection
+    case "${modeSelection}" in
+        2) mode=stream-up ;;
+        3) mode=auto ;;
+        *) mode=packet-up ;;
+    esac
+    read -r -p "上行 ALPN[h2/h3/h2,h3，默认:h2]:" alpn
+    alpn=${alpn:-h2}
+    [[ "${alpn}" == "h2" || "${alpn}" == "h3" || "${alpn}" == "h2,h3" ]] || { echoContent red " ---> ALPN输入错误"; return 1; }
+    local defaultSNI=${xrayVLESSXHTTPTLSServerName:-${currentHost}}
+    [[ -z "${defaultSNI}" ]] && defaultSNI=$(jq -r '.advertise_address // empty' "${file}")
+    read -r -p "上行 SNI[默认:${defaultSNI}]:" sni
+    sni=${sni:-${defaultSNI}}
+    read -r -p "上行 Host[默认:${sni}]:" host
+    host=${host:-${sni}}
+
+    local dlAddress dlPort dlSNI dlHost dlPath dlALPN downloadJSON=null
+    read -r -p "下行 CDN 地址[留空表示不分离]:" dlAddress
+    if [[ -n "${dlAddress}" ]]; then
+        read -r -p "下行端口[默认:443]:" dlPort
+        dlPort=${dlPort:-443}
+        isValidXHTTPTLSPort "${dlPort}" || { echoContent red " ---> 下行端口输入错误"; return 1; }
+        read -r -p "下行 SNI[默认:${sni}]:" dlSNI
+        dlSNI=${dlSNI:-${sni}}
+        read -r -p "下行 Host[默认:${dlSNI}]:" dlHost
+        dlHost=${dlHost:-${dlSNI}}
+        read -r -p "下行路径[默认当前XHTTP路径]:" dlPath
+        dlPath=${dlPath:-/$(jq -r '.inbounds[0].streamSettings.xhttpSettings.path // "xHTTP"' /etc/v2ray-agent/xray/conf/14_VLESS_XHTTP_TLS_inbounds.json 2>/dev/null | sed 's|^/||')}
+        read -r -p "下行 ALPN[默认:h2]:" dlALPN
+        dlALPN=${dlALPN:-h2}
+        downloadJSON=$(jq -n --arg address "${dlAddress}" --argjson port "${dlPort}" --arg sni "${dlSNI}" --arg host "${dlHost}" --arg path "${dlPath}" --arg alpn "${dlALPN}" \
+          '{address:$address,port:$port,network:"xhttp",security:"tls",tlsSettings:{serverName:$sni,alpn:($alpn|split(","))},xhttpSettings:{path:$path,host:$host}}')
+        mode=stream-up
+    fi
+
+    local tmp
+    tmp=$(mktemp "$(dirname "${file}")/.xhttp_tls.endpoint.XXXXXX") || return 1
+    if ! jq --arg name "${name}" --arg address "${address}" --argjson port "${port}" --arg mode "${mode}" --arg alpn "${alpn}" --arg sni "${sni}" --arg host "${host}" --argjson download "${downloadJSON}" '
+      .endpoints = (.endpoints // []) + [{name:$name,address:$address,port:$port,mode:$mode,alpn:$alpn,sni:$sni,host:$host} +
+        (if $download == null then {} else {download_settings:$download} end)]
+    ' "${file}" >"${tmp}"; then
+        rm -f "${tmp}"
+        return 1
+    fi
+    mv -f "${tmp}" "${file}"
+    echoContent green " ---> 端点已添加，重新生成订阅后生效"
+}
+
+deleteXHTTPTLSEndpoint() {
+    local file=${xhttpTLSEndpointConfigFile:-/etc/v2ray-agent/xhttp_tls.json}
+    showXHTTPTLSEndpoints || return 1
+    local count index tmp
+    count=$(jq '.endpoints // [] | length' "${file}")
+    ((count > 0)) || return 0
+    read -r -p "请输入要删除的编号:" index
+    [[ "${index}" =~ ^[0-9]+$ ]] && ((index >= 1 && index <= count)) || { echoContent red " ---> 编号无效"; return 1; }
+    tmp=$(mktemp "$(dirname "${file}")/.xhttp_tls.endpoint.XXXXXX") || return 1
+    jq --argjson index "$((index - 1))" 'del(.endpoints[$index])' "${file}" >"${tmp}" && mv -f "${tmp}" "${file}"
+}
+
+manageXHTTPTLS() {
+    echoContent skyBlue "\n===== XHTTP TLS 端点管理 ====="
+    echoContent yellow "1.查看部署与端点"
+    echoContent yellow "2.添加 CDN/上下行分离端点"
+    echoContent yellow "3.删除端点"
+    echoContent yellow "0.返回"
+    local selection
+    read -r -p "请选择:" selection
+    case "${selection}" in
+        1) showXHTTPTLSEndpoints ;;
+        2) addXHTTPTLSEndpoint ;;
+        3) deleteXHTTPTLSEndpoint ;;
+        *) return ;;
+    esac
+}
+
 # 主菜单
 menu() {
     cd "$HOME" || exit
@@ -10543,6 +10917,7 @@ menu() {
     echoContent yellow "16.core管理"
     echoContent yellow "17.更新脚本"
     echoContent yellow "18.安装BBR、DD脚本"
+    echoContent yellow "19.XHTTP TLS端点管理"
     echoContent skyBlue "-------------------------脚本管理-----------------------------"
     echoContent yellow "20.卸载脚本"
     echoContent red "=============================================================="
@@ -10604,10 +10979,15 @@ menu() {
     18)
         bbrInstall
         ;;
+    19)
+        manageXHTTPTLS
+        ;;
     20)
         unInstall 1
         ;;
     esac
 }
-cronFunction
-menu
+if [[ "${V2RAY_AGENT_LIB_ONLY:-false}" != true ]]; then
+    cronFunction
+    menu
+fi
