@@ -1146,7 +1146,7 @@ allowPort() {
                 checkUFWAllowPort "$1"
             fi
         fi
-    elif dpkg -l | grep -q "^[[:space:]]*ii[[:space:]]\+netfilter-persistent" && systemctl status netfilter-persistent 2>/dev/null | grep -q "active (exited)"; then
+    elif command -v dpkg >/dev/null 2>&1 && dpkg -l | grep -q "^[[:space:]]*ii[[:space:]]\+netfilter-persistent" && systemctl status netfilter-persistent 2>/dev/null | grep -q "active (exited)"; then
         local updateFirewalldStatus=
         if ! iptables -L | grep -q "$1/${type}(mack-a)"; then
             updateFirewalldStatus=true
