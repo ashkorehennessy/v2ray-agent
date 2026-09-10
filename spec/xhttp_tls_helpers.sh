@@ -66,16 +66,16 @@ packet.example.com
 1
 h3
 viewer.example.com
-viewer.example.com
 download.example.com
 443
-download-viewer.example.com
 download-viewer.example.com
 /downloadxHTTP
 h3
 EOF
 assert_eq "$(jq -r '.endpoints[-1].mode' "${xhttpTLSEndpointConfigFile}")" "packet-up"
+assert_eq "$(jq -r '.endpoints[-1] | [.sni, .host] | unique | length' "${xhttpTLSEndpointConfigFile}")" "1"
 assert_eq "$(jq -r '.endpoints[-1].download_settings.address' "${xhttpTLSEndpointConfigFile}")" "download.example.com"
+assert_eq "$(jq -r '.endpoints[-1].download_settings | [.tlsSettings.serverName, .xhttpSettings.host] | unique | length' "${xhttpTLSEndpointConfigFile}")" "1"
 
 extra='{"downloadSettings":{"address":"cdn.example.com","port":443,"network":"xhttp","security":"tls","tlsSettings":{"serverName":"example.com"},"xhttpSettings":{"path":"/demo","host":"example.com"}}}'
 uri=$(buildVLESSXHTTPTLSURI edge.example.com 443 '00000000-0000-4000-8000-000000000001' example.com demo stream-up test h2 example.com "${extra}")

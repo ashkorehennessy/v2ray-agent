@@ -10787,11 +10787,11 @@ showXHTTPTLSEndpoints() {
 addXHTTPTLSEndpoint() {
     local file=${xhttpTLSEndpointConfigFile:-/etc/v2ray-agent/xhttp_tls.json}
     [[ -s "${file}" ]] || { echoContent red " ---> 请先安装 VLESS+XHTTP+TLS"; return 1; }
-    local name address port modeSelection mode alpn sni host
+    local name address port modeSelection mode alpn sni
     read -r -p "端点名称[如:cdn-hk]:" name
-    read -r -p "上行地址[IP/域名]:" address
+    read -r -p "上行 Server[IP/域名]:" address
     [[ -n "${name}" && -n "${address}" ]] || { echoContent red " ---> 名称和地址不能为空"; return 1; }
-    read -r -p "上行端口[默认:443]:" port
+    read -r -p "上行 Port[默认:443]:" port
     port=${port:-443}
     isValidXHTTPTLSPort "${port}" || { echoContent red " ---> 端口输入错误"; return 1; }
     echoContent yellow "上行模式: 1.packet-up[默认/CDN/H3] 2.stream-up[流式上行] 3.auto[直连]"
@@ -10806,33 +10806,29 @@ addXHTTPTLSEndpoint() {
     [[ "${alpn}" == "h2" || "${alpn}" == "h3" || "${alpn}" == "h2,h3" ]] || { echoContent red " ---> ALPN输入错误"; return 1; }
     local defaultSNI=${xrayVLESSXHTTPTLSServerName:-${currentHost}}
     [[ -z "${defaultSNI}" ]] && defaultSNI=$(jq -r '.advertise_address // empty' "${file}")
-    read -r -p "上行 SNI[默认:${defaultSNI}]:" sni
+    read -r -p "上行 SNI/Host[默认:${defaultSNI}]:" sni
     sni=${sni:-${defaultSNI}}
-    read -r -p "上行 Host[默认:${sni}]:" host
-    host=${host:-${sni}}
 
-    local dlAddress dlPort dlSNI dlHost dlPath dlALPN downloadJSON=null
-    read -r -p "下行 CDN 地址[留空表示不分离]:" dlAddress
+    local dlAddress dlPort dlSNI dlPath dlALPN downloadJSON=null
+    read -r -p "下行 Server[留空表示不分离]:" dlAddress
     if [[ -n "${dlAddress}" ]]; then
-        read -r -p "下行端口[默认:443]:" dlPort
+        read -r -p "下行 Port[默认:443]:" dlPort
         dlPort=${dlPort:-443}
         isValidXHTTPTLSPort "${dlPort}" || { echoContent red " ---> 下行端口输入错误"; return 1; }
-        read -r -p "下行 SNI[默认:${sni}]:" dlSNI
+        read -r -p "下行 SNI/Host[默认:${sni}]:" dlSNI
         dlSNI=${dlSNI:-${sni}}
-        read -r -p "下行 Host[默认:${dlSNI}]:" dlHost
-        dlHost=${dlHost:-${dlSNI}}
         read -r -p "下行路径[默认当前XHTTP路径]:" dlPath
         dlPath=${dlPath:-/$(jq -r '.inbounds[0].streamSettings.xhttpSettings.path // "xHTTP"' /etc/v2ray-agent/xray/conf/14_VLESS_XHTTP_TLS_inbounds.json 2>/dev/null | sed 's|^/||')}
         read -r -p "下行 ALPN[默认:h2]:" dlALPN
         dlALPN=${dlALPN:-h2}
-        downloadJSON=$(jq -n --arg address "${dlAddress}" --argjson port "${dlPort}" --arg sni "${dlSNI}" --arg host "${dlHost}" --arg path "${dlPath}" --arg alpn "${dlALPN}" \
-          '{address:$address,port:$port,network:"xhttp",security:"tls",tlsSettings:{serverName:$sni,alpn:($alpn|split(","))},xhttpSettings:{path:$path,host:$host}}')
+        downloadJSON=$(jq -n --arg address "${dlAddress}" --argjson port "${dlPort}" --arg sni "${dlSNI}" --arg path "${dlPath}" --arg alpn "${dlALPN}" \
+          '{address:$address,port:$port,network:"xhttp",security:"tls",tlsSettings:{serverName:$sni,alpn:($alpn|split(","))},xhttpSettings:{path:$path,host:$sni}}')
     fi
 
     local tmp
     tmp=$(mktemp "$(dirname "${file}")/.xhttp_tls.endpoint.XXXXXX") || return 1
-    if ! jq --arg name "${name}" --arg address "${address}" --argjson port "${port}" --arg mode "${mode}" --arg alpn "${alpn}" --arg sni "${sni}" --arg host "${host}" --argjson download "${downloadJSON}" '
-      .endpoints = (.endpoints // []) + [{name:$name,address:$address,port:$port,mode:$mode,alpn:$alpn,sni:$sni,host:$host} +
+    if ! jq --arg name "${name}" --arg address "${address}" --argjson port "${port}" --arg mode "${mode}" --arg alpn "${alpn}" --arg sni "${sni}" --argjson download "${downloadJSON}" '
+      .endpoints = (.endpoints // []) + [{name:$name,address:$address,port:$port,mode:$mode,alpn:$alpn,sni:$sni,host:$sni} +
         (if $download == null then {} else {download_settings:$download} end)]
     ' "${file}" >"${tmp}"; then
         rm -f "${tmp}"
