@@ -10794,7 +10794,7 @@ addXHTTPTLSEndpoint() {
     read -r -p "上行端口[默认:443]:" port
     port=${port:-443}
     isValidXHTTPTLSPort "${port}" || { echoContent red " ---> 端口输入错误"; return 1; }
-    echoContent yellow "上行模式: 1.packet-up[默认/CDN] 2.stream-up[上下行分离] 3.auto[直连]"
+    echoContent yellow "上行模式: 1.packet-up[默认/CDN/H3] 2.stream-up[流式上行] 3.auto[直连]"
     read -r -p "请选择:" modeSelection
     case "${modeSelection}" in
         2) mode=stream-up ;;
@@ -10827,7 +10827,6 @@ addXHTTPTLSEndpoint() {
         dlALPN=${dlALPN:-h2}
         downloadJSON=$(jq -n --arg address "${dlAddress}" --argjson port "${dlPort}" --arg sni "${dlSNI}" --arg host "${dlHost}" --arg path "${dlPath}" --arg alpn "${dlALPN}" \
           '{address:$address,port:$port,network:"xhttp",security:"tls",tlsSettings:{serverName:$sni,alpn:($alpn|split(","))},xhttpSettings:{path:$path,host:$host}}')
-        mode=stream-up
     fi
 
     local tmp

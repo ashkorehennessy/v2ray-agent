@@ -4,6 +4,7 @@ set -euo pipefail
 repo_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 V2RAY_AGENT_LIB_ONLY=true source "${repo_dir}/install.sh"
 initVar ""
+printN=
 
 fail() {
     printf 'FAIL: %s\n' "$1" >&2
@@ -57,6 +58,24 @@ custom_endpoint=$(listXHTTPTLSEndpoints 38.55.146.16 11451 '' | tail -1)
 assert_eq "$(cut -f1-6 <<<"${custom_endpoint}")" $'relay.example.com\t8443\tstream-up\th3\torigin.example.com\torigin.example.com'
 decoded_extra=$(cut -f7 <<<"${custom_endpoint}" | base64 -d)
 assert_eq "$(jq -r '.downloadSettings.address' <<<"${decoded_extra}")" "cdn.example.com"
+
+addXHTTPTLSEndpoint <<'EOF'
+packet-split
+packet.example.com
+443
+1
+h3
+viewer.example.com
+viewer.example.com
+download.example.com
+443
+download-viewer.example.com
+download-viewer.example.com
+/downloadxHTTP
+h3
+EOF
+assert_eq "$(jq -r '.endpoints[-1].mode' "${xhttpTLSEndpointConfigFile}")" "packet-up"
+assert_eq "$(jq -r '.endpoints[-1].download_settings.address' "${xhttpTLSEndpointConfigFile}")" "download.example.com"
 
 extra='{"downloadSettings":{"address":"cdn.example.com","port":443,"network":"xhttp","security":"tls","tlsSettings":{"serverName":"example.com"},"xhttpSettings":{"path":"/demo","host":"example.com"}}}'
 uri=$(buildVLESSXHTTPTLSURI edge.example.com 443 '00000000-0000-4000-8000-000000000001' example.com demo stream-up test h2 example.com "${extra}")
