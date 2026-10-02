@@ -989,13 +989,22 @@ getPublicIP() {
         echo "${currentHost}"
     else
         local currentIP=
-        currentIP=$(curl -s "-${type}" http://www.cloudflare.com/cdn-cgi/trace | grep "ip" | awk -F "[=]" '{print $2}')
+        currentIP=$(curl --connect-timeout 2 --max-time 4 -s "-${type}" http://www.cloudflare.com/cdn-cgi/trace | grep "ip" | awk -F "[=]" '{print $2}')
         if [[ -z "${currentIP}" && -z "$1" ]]; then
-            currentIP=$(curl -s "-6" http://www.cloudflare.com/cdn-cgi/trace | grep "ip" | awk -F "[=]" '{print $2}')
+            currentIP=$(curl --connect-timeout 2 --max-time 4 -s "-6" http://www.cloudflare.com/cdn-cgi/trace | grep "ip" | awk -F "[=]" '{print $2}')
         fi
         echo "${currentIP}"
     fi
 
+}
+
+# Prefer the configured public XHTTP address and avoid needless IPv4 probing on IPv6-only hosts.
+getXHTTPTLSOriginAddress() {
+    if [[ -n "${xhttpTLSAdvertiseAddress:-}" ]]; then
+        printf '%s\n' "${xhttpTLSAdvertiseAddress}"
+    else
+        getPublicIP
+    fi
 }
 
 # Output ufw port open status
@@ -5889,7 +5898,7 @@ showAccounts() {
                 currentXHTTPMode="${endpointMode}"
                 defaultBase64Code vlessXHTTPTLS "${endpointPort}" "${nodeName}" "${uuidValue}" "${endpointAddress}" "/${currentPath}xHTTP"
                 endpointIndex=$((endpointIndex + 1))
-            done < <(listXHTTPTLSEndpoints "$(getPublicIP)" "${xrayVLESSXHTTPTLSPort}" "${xhttpTLSCDNAddress}")
+            done < <(listXHTTPTLSEndpoints "$(getXHTTPTLSOriginAddress)" "${xrayVLESSXHTTPTLSPort}" "${xhttpTLSCDNAddress}")
         done < <(jq -c '.inbounds[0].settings.clients[]?' "${configPath}14_VLESS_XHTTP_TLS_inbounds.json")
     fi
     # AnyTLS

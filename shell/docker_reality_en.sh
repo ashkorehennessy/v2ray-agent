@@ -1363,12 +1363,12 @@ getPublicIP() {
     local currentIP=""
 
     if command -v curl >/dev/null 2>&1; then
-        currentIP=$(curl -fsS -4 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | grep '^ip=' | awk -F '=' '{print $2}')
+        currentIP=$(curl --connect-timeout 2 --max-time 4 -fsS -4 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | grep '^ip=' | awk -F '=' '{print $2}')
         if [[ -z "${currentIP}" ]]; then
-            currentIP=$(curl -fsS -6 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | grep '^ip=' | awk -F '=' '{print $2}')
+            currentIP=$(curl --connect-timeout 2 --max-time 4 -fsS -6 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | grep '^ip=' | awk -F '=' '{print $2}')
         fi
         if [[ -z "${currentIP}" ]]; then
-            currentIP=$(curl -fsS https://api.ipify.org 2>/dev/null || true)
+            currentIP=$(curl --connect-timeout 2 --max-time 4 -fsS https://api.ipify.org 2>/dev/null || true)
         fi
     fi
 

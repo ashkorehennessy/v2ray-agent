@@ -51,6 +51,11 @@ writeXHTTPTLSEndpointSettings
 assert_eq "$(jq -r '.entry_mode' "${xhttpTLSEndpointConfigFile}")" "direct"
 assert_eq "$(listXHTTPTLSEndpoints 38.55.146.16 11451 '' | cut -f1-4)" $'us02.1080999.xyz\t11451\tauto\th2,h3'
 
+getPublicIP() {
+    fail 'public IP lookup must be skipped when advertise_address is configured'
+}
+assert_eq "$(getXHTTPTLSOriginAddress)" "us02.1080999.xyz"
+
 jq '.endpoints += [{name:"split",address:"relay.example.com",port:8443,mode:"stream-up",alpn:"h3",sni:"origin.example.com",host:"origin.example.com",download_settings:{address:"cdn.example.com",port:443,network:"xhttp",security:"tls",tlsSettings:{serverName:"origin.example.com",alpn:["h2"]},xhttpSettings:{path:"/demoxHTTP",host:"origin.example.com"}}}]' \
     "${xhttpTLSEndpointConfigFile}" >"${tmp_dir}/with-endpoint.json"
 mv "${tmp_dir}/with-endpoint.json" "${xhttpTLSEndpointConfigFile}"

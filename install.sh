@@ -1168,13 +1168,22 @@ getPublicIP() {
         echo "${currentHost}"
     else
         local currentIP=
-        currentIP=$(curl -s "-${type}" http://www.cloudflare.com/cdn-cgi/trace | grep "ip" | awk -F "[=]" '{print $2}')
+        currentIP=$(curl --connect-timeout 2 --max-time 4 -s "-${type}" http://www.cloudflare.com/cdn-cgi/trace | grep "ip" | awk -F "[=]" '{print $2}')
         if [[ -z "${currentIP}" && -z "$1" ]]; then
-            currentIP=$(curl -s "-6" http://www.cloudflare.com/cdn-cgi/trace | grep "ip" | awk -F "[=]" '{print $2}')
+            currentIP=$(curl --connect-timeout 2 --max-time 4 -s "-6" http://www.cloudflare.com/cdn-cgi/trace | grep "ip" | awk -F "[=]" '{print $2}')
         fi
         echo "${currentIP}"
     fi
 
+}
+
+# XHTTP 已配置对外地址时直接使用，避免 IPv6-only 主机无谓探测 IPv4。
+getXHTTPTLSOriginAddress() {
+    if [[ -n "${xhttpTLSAdvertiseAddress:-}" ]]; then
+        printf '%s\n' "${xhttpTLSAdvertiseAddress}"
+    else
+        getPublicIP
+    fi
 }
 
 # 输出ufw端口开放状态
@@ -6097,7 +6106,7 @@ showAccounts() {
                 [[ -n "${endpointLabel}" && "${endpointLabel}" != "-" ]] && nodeName="${email}_${endpointLabel}"
                 defaultBase64Code vlessXHTTPTLS "${endpointPort}" "${nodeName}" "${uuidValue}" "${endpointAddress}" "${currentPath}xHTTP"
                 endpointIndex=$((endpointIndex + 1))
-            done < <(listXHTTPTLSEndpoints "$(getPublicIP)" "${xrayVLESSXHTTPTLSPort}" "${xhttpTLSCDNAddress}")
+            done < <(listXHTTPTLSEndpoints "$(getXHTTPTLSOriginAddress)" "${xrayVLESSXHTTPTLSPort}" "${xhttpTLSCDNAddress}")
         done < <(jq -c '.inbounds[0].settings.clients[]?' "${xhttpTLSAccountConfig}")
         currentHost=${xhttpTLSPreviousHost}
     fi
