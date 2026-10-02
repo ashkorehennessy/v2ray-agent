@@ -6965,13 +6965,17 @@ handleFirewall() {
 # 安装BBR
 bbrInstall() {
     echoContent red "\n=============================================================="
-    echoContent green "BBR、DD脚本用的[ylx2016]的成熟作品，地址[https://github.com/ylx2016/Linux-NetSpeed]，请熟知"
+    echoContent green "BBR、DD脚本使用[ashkorehennessy]维护的分支，地址[https://github.com/ashkorehennessy/Linux-NetSpeed]，请熟知"
     echoContent yellow "1.安装脚本【推荐原版BBR+FQ】"
     echoContent yellow "2.回退主目录"
     echoContent red "=============================================================="
     read -r -p "请选择:" installBBRStatus
     if [[ "${installBBRStatus}" == "1" ]]; then
-        wget -O tcpx.sh "https://github.com/ylx2016/Linux-NetSpeed/raw/master/tcpx.sh" && chmod +x tcpx.sh && ./tcpx.sh
+        local bbrScript="tcpx.sh"
+        if [[ -f /etc/alpine-release && "$(uname -m)" =~ ^(aarch64|arm64)$ ]]; then
+            bbrScript="alpine-bbr-fq.sh"
+        fi
+        wget -O "${bbrScript}" "https://raw.githubusercontent.com/ashkorehennessy/Linux-NetSpeed/master/${bbrScript}" && chmod +x "${bbrScript}" && ./"${bbrScript}"
     else
         menu
     fi

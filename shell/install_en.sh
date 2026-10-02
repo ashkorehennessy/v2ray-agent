@@ -6771,7 +6771,11 @@ bbrInstall() {
     echoContent red "=============================================================="
     read -r -p "Please select:" installBBRStatus
     if [[ "${installBBRStatus}" == "1" ]]; then
-        wget -O tcpx.sh "https://github.com/ylx2016/Linux-NetSpeed/raw/master/tcpx.sh" && chmod +x tcpx.sh && ./tcpx.sh
+        local bbrScript="tcpx.sh"
+        if [[ -f /etc/alpine-release && "$(uname -m)" =~ ^(aarch64|arm64)$ ]]; then
+            bbrScript="alpine-bbr-fq.sh"
+        fi
+        wget -O "${bbrScript}" "https://raw.githubusercontent.com/ashkorehennessy/Linux-NetSpeed/master/${bbrScript}" && chmod +x "${bbrScript}" && ./"${bbrScript}"
     else
         menu
     fi
@@ -8149,7 +8153,7 @@ removeSocks5Routing() {
         echoContent red " ---> Available types are not installed"
         exit 0
     fi
-    echoContent green "The mature works of [ylx2016] used for BBR and DD scripts, the address [https://github.com/ylx2016/Linux-NetSpeed], please be familiar with it"
+    echoContent green "The BBR and DD scripts use the fork maintained by [ashkorehennessy]: [https://github.com/ashkorehennessy/Linux-NetSpeed]"
     reloadCore
 }
 setSocks5Inbound() {
