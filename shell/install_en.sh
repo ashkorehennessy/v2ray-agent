@@ -101,14 +101,22 @@ checkCPUVendor() {
                 xrayCoreCPUVendor="Xray-linux-64"
                 #                v2rayCoreCPUVendor="v2ray-linux-64"
                 warpRegCoreCPUVendor="main-linux-amd64"
-                singBoxCoreCPUVendor="-linux-amd64"
+                if [[ "${release}" == "alpine" ]]; then
+                    singBoxCoreCPUVendor="-linux-amd64-musl"
+                else
+                    singBoxCoreCPUVendor="-linux-amd64"
+                fi
                 ;;
             'armv8' | 'aarch64')
                 cpuVendor="arm"
                 xrayCoreCPUVendor="Xray-linux-arm64-v8a"
                 #                v2rayCoreCPUVendor="v2ray-linux-arm64-v8a"
                 warpRegCoreCPUVendor="main-linux-arm64"
-                singBoxCoreCPUVendor="-linux-arm64"
+                if [[ "${release}" == "alpine" ]]; then
+                    singBoxCoreCPUVendor="-linux-arm64-musl"
+                else
+                    singBoxCoreCPUVendor="-linux-arm64"
+                fi
                 ;;
             *)
                 echo "This CPU architecture is not supported --->"
